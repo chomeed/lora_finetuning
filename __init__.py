@@ -1,22 +1,23 @@
 """On-the-fly LoRA fine-tuning of a base policy, served through lerobot's async inference stack.
 
-Two processes, one directory between them:
+Two processes, connected by gRPC (pull model — the client asks when it wants params):
 
-    learner.py            --adapter_dir=DIR   trains LoRA adapters, publishes versions
-    lora_policy_server.py --adapter_dir=DIR   serves the policy, hot-swaps adapters
+    trainer.py            --serve_port=PORT     trains LoRA adapters, hosts the AdapterService
+    lora_policy_server.py --adapter_addr=H:PORT serves the policy, pulls + hot-swaps adapters
 
-See adapter_store.py for the (deliberately tiny) hand-off protocol.
+See the transport/ subpackage for the hand-off protocol.
 """
 
-from .adapter_store import AdapterVersion, AdapterWatcher, publish_adapter, read_latest
-from .configs import LoRALearnerConfig, LoRAPolicyServerConfig, LoRASpec
+from .configs import LoRAPolicyServerConfig, LoRASpec, LoRATrainerConfig, RealtimeConverterConfig
+from .transport import AdapterApplier, AdapterClient, AdapterPublisher, AdapterVersion
 
 __all__ = [
+    "AdapterApplier",
+    "AdapterClient",
+    "AdapterPublisher",
     "AdapterVersion",
-    "AdapterWatcher",
-    "LoRALearnerConfig",
+    "LoRATrainerConfig",
     "LoRAPolicyServerConfig",
     "LoRASpec",
-    "publish_adapter",
-    "read_latest",
+    "RealtimeConverterConfig",
 ]

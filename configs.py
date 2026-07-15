@@ -1,4 +1,4 @@
-"""Draccus configs for the LoRA learner and the adapter-aware policy server."""
+"""Draccus configs for the LoRA trainer and the adapter-aware policy server."""
 
 
 from dataclasses import dataclass, field
@@ -50,13 +50,16 @@ class LoRASpec:
 
 
 @dataclass
-class LoRALearnerConfig:
-    """Config for `learner.py`: flow-matching BC on a LeRobot dataset, LoRA only."""
+class LoRATrainerConfig:
+    """Config for `trainer.py`: flow-matching BC on a LeRobot dataset, LoRA only."""
 
     # --- what to fine-tune -------------------------------------------------
     pretrained_path: str  # base policy checkpoint (the same one policy_server loads)
     dataset_repo_id: str  # LeRobot dataset id, e.g. "chomeed/board_handover"
-    adapter_dir: str  # watch dir the policy server polls
+
+    # --- adapter streaming (trainer hosts the gRPC server) -----------------
+    serve_host: str = "0.0.0.0"  # interface the AdapterService binds
+    serve_port: int = 8090  # port policy servers dial to subscribe
 
     dataset_root: str | None = None  # local dataset dir, if not under HF cache
     policy_type: str = "pi05"
@@ -82,7 +85,6 @@ class LoRALearnerConfig:
     # --- publishing --------------------------------------------------------
     publish_freq: int = 500  # steps between adapter publishes
     publish_at_start: bool = True  # publish the (identity) adapter at step 0
-    keep_last: int = 5  # versioned dirs to retain on disk
     log_freq: int = 50
     resume_adapter_path: str | None = None  # continue from a published adapter dir
 
@@ -94,12 +96,79 @@ class LoRALearnerConfig:
 
 
 @dataclass
+class RealtimeConverterConfig:
+    """Config for `realtime_converter.py`: watch an ingest dir for recorded HDF5
+    episodes and append each one to a growing LeRobot dataset, throttled so it
+    never starves the co-located (high-priority) policy server."""
+
+    # --- what to watch / where to write ------------------------------------
+    ingest_dir: str  # directory the robot uploads finished episode_*.h5 into
+    dataset_repo_id: str  # LeRobot dataset id to append into, e.g. "chomeed/board_handover"
+    dataset_root: str  # local dir for the growing dataset (created on first episode)
+
+    glob: str = "episode_*.h5"  # which files in ingest_dir are episodes
+    default_task: str = ""  # task string when an episode's `task` attr is empty
+    task_filter: str | None = None  # if set, only convert episodes whose task matches
+    fps: int = 30  # fallback fps when the episode carries none
+
+    # --- scan / loop -------------------------------------------------------
+    poll_interval_s: float = 2.0  # sleep between ingest-dir scans when idle
+    min_age_s: float = 1.0  # ignore files touched more recently (belt-and-suspenders vs partial writes)
+    run_once: bool = False  # convert the current backlog and exit (no watching)
+    num_decode_workers: int = 4  # threads decoding JPEGs ahead of the writer
+
+    # --- video encoding ----------------------------------------------------
+    # Streaming encoding pipes each frame into the video encoder as it is added,
+    # instead of writing every frame as a temp PNG and batch-encoding the whole
+    # episode at save time. It removes the temp-image disk churn and spreads the
+    # encode CPU across the episode rather than bursting it at the end.
+    streaming_encoding: bool = True
+    vcodec: str = "libsvtav1"  # AV1; needs system ffmpeg with the encoder built in
+    encoder_queue_maxsize: int = 30  # max buffered frames per camera (streaming only)
+    encoder_threads: int | None = None  # threads per encoder instance; None = auto
+
+    # --- source-file disposition (the ingest dir IS the queue) -------------
+    # No ledger: a file sitting in the ingest dir is pending; once handled it
+    # leaves the scan set. On a successful conversion the .h5 (and its .sha256
+    # sidecar) is deleted -- the robot keeps the raw recording -- unless
+    # delete_on_success is False, in which case it is moved into converted_dir.
+    # Files that fail or can't be converted are moved to failed_dir so they are
+    # not retried on every scan.
+    delete_on_success: bool = True
+    converted_dir: str | None = None  # move here instead of deleting; None -> <ingest_dir>/converted
+    failed_dir: str | None = None  # unconvertible files land here; None -> <ingest_dir>/failed
+    verify_checksum: bool = True  # if a <name>.sha256 sidecar exists, verify before converting
+
+    # --- throttling (stay out of the policy server's way) ------------------
+    gpu_index: int = 0  # GPU whose utilization gates conversion
+    gpu_util_pause: int = 60  # pause when utilization.gpu (%) is at/above this
+    gpu_util_resume: int = 40  # resume once it drops to/below this (hysteresis)
+    throttle_poll_s: float = 5.0  # how often to re-check the throttle signal while paused
+    # Touch this file to pause conversion regardless of GPU; remove it to resume.
+    # None -> <ingest_dir>/.pause
+    pause_file: str | None = None
+    nice: int = 15  # CPU niceness applied to this process (and its encode children)
+    ionice_idle: bool = True  # best-effort `ionice -c3` so disk IO yields to the server
+
+    def __post_init__(self):
+        if self.gpu_util_resume > self.gpu_util_pause:
+            raise ValueError(
+                f"gpu_util_resume ({self.gpu_util_resume}) must be <= gpu_util_pause "
+                f"({self.gpu_util_pause}) for the hysteresis to make sense"
+            )
+
+
+@dataclass
 class LoRAPolicyServerConfig(PolicyServerConfig):
     """PolicyServerConfig plus adapter hot-reload settings."""
 
-    # Directory the learner publishes adapters into. None disables hot-reload
-    # entirely, making this server behave exactly like the stock PolicyServer.
-    adapter_dir: str | None = None
+    # Address of the trainer's AdapterService, "host:port". None disables
+    # hot-reload entirely, making this server behave exactly like the stock
+    # PolicyServer.
+    adapter_addr: str | None = None
+
+    # Local dir to materialize received adapters into. None -> a temp dir.
+    adapter_cache_dir: str | None = None
 
     # Where a newer adapter is allowed to be swapped in:
     #   "chunk"     -> at any action-chunk boundary (fastest propagation)

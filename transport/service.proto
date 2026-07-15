@@ -1,0 +1,49 @@
+// gRPC hand-off protocol for LoRA adapters: trainer (server) -> policy server (client).
+//
+// Pull model: the trainer hosts AdapterService and keeps the latest adapter. The
+// client decides *when* to ask -- it calls GetLatestAdapter whenever it wants a
+// fresh version (e.g. at an action-chunk boundary or between episodes). If the
+// trainer has nothing newer than the client's have_version, it returns an empty
+// stream (a cheap round-trip); otherwise it streams the adapter as AdapterChunk
+// messages (safetensors bytes are chunked because they can exceed gRPC's 4MB cap).
+//
+// Regenerate the Python stubs from the policy_learning root with:
+//
+//   python -m grpc_tools.protoc -I . \
+//     --python_out=. --grpc_python_out=. \
+//     lora_finetuning/transport/service.proto
+//
+// (Referred to lerobot's transport/services.proto for the chunked-stream shape,
+// but this is a standalone service.)
+
+syntax = "proto3";
+
+package lora_adapter;
+
+service AdapterService {
+  // Client-driven pull: return the current adapter if it is strictly newer than
+  // have_version, else an empty stream. The client calls this on its own schedule.
+  rpc GetLatestAdapter(GetLatestRequest) returns (stream AdapterChunk);
+}
+
+message GetLatestRequest {
+  // Version the client already has loaded. The trainer sends the latest adapter
+  // only if it is strictly newer. Send 0 to always get the current adapter.
+  int32 have_version = 1;
+}
+
+message AdapterMeta {
+  int32 version = 1;
+  int64 step = 2;
+  double loss = 3;
+  bool has_loss = 4;          // proto3 has no null; guards `loss`
+  double published_at = 5;
+  string config_json = 6;     // adapter_config.json contents, inline
+  int64 total_bytes = 7;      // full safetensors size, so the client can show a progress bar
+}
+
+message AdapterChunk {
+  AdapterMeta meta = 1;       // set only on the first chunk of each adapter
+  bytes weights = 2;          // a slice of adapter_model.safetensors
+  bool last = 3;              // true on the final chunk of an adapter
+}

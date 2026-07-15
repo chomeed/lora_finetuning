@@ -1,4 +1,4 @@
-"""LoRA learner: EXPO-style base-policy fine-tuning, publishable to a live policy server.
+"""LoRA trainer: EXPO-style base-policy fine-tuning, publishable to a live policy server.
 
 Trains *only* LoRA adapters on top of a frozen base policy (PI05 by default) with
 the policy's own flow-matching / denoising loss on a LeRobot dataset -- the same
@@ -7,29 +7,36 @@ online. There is no critic and no value weighting in this process: whatever
 filtering you want (successful episodes only, corrected rollouts only) happens
 upstream, in which episodes you point it at.
 
-Every ``publish_freq`` steps it writes the adapter (a few MB, never the base) into
-``adapter_dir``, where ``lora_policy_server.py`` picks it up and swaps it into the
-running policy without a restart.
+Every ``publish_freq`` steps it makes the new adapter (a few MB, never the base) the
+one its AdapterService serves. A ``lora_policy_server.py`` pulls the latest adapter
+over gRPC whenever it wants and swaps it into the running policy without a restart --
+the trainer hosts the server and holds the current adapter; it never pushes.
 
 Usage:
-    python -m lora_finetuning.learner \
-        --pretrained_path=/path/to/pi05_checkpoint/pretrained_model \
-        --dataset_repo_id=chomeed/board_handover \
-        --dataset_root=/path/to/dataset \
-        --adapter_dir=/path/to/adapters \
+    python -m lora_finetuning.trainer \
+        --pretrained_path=/home/rllab4/workspace/chomeed/hdr_robot/policy_learning/outputs/ablation/board_insertion_ablation_third_pi05_delta_recomputed_stats_25k \
+        --dataset_repo_id=chomeed/board_insertion_ablation_dagger \
+        --serve_host=0.0.0.0 --serve_port=8090 \
+        --steps=20000 --batch_size=8 --lr=1e-4
+
+    python -m lora_finetuning.trainer \
+        --pretrained_path=outputs/ablation/board_insertion_ablation_head_pi05_delta_recomputed_stats_25k \
+        --dataset_repo_id=chomeed/board_insertion_ablation_dagger \
+        --serve_host=0.0.0.0 --serve_port=8090 \
         --steps=20000 --batch_size=8 --lr=1e-4
 """
 
 import logging
 import math
+import os
 import time
 from dataclasses import asdict
-from pathlib import Path
 from pprint import pformat
 
 import draccus
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -37,10 +44,16 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
 
-from .adapter_store import next_version, publish_adapter
-from .configs import PI05_LORA_TARGETS, PI05_POLICY_TYPES, LoRALearnerConfig
+from .configs import PI05_LORA_TARGETS, PI05_POLICY_TYPES, LoRATrainerConfig
 
-logger = logging.getLogger("lora_learner")
+# gRPC installs pthread_atfork handlers that log "skipping fork() handlers" every time
+# the DataLoader forks a worker. The workers never touch gRPC, so disable fork support.
+# Must be set before the transport import pulls in grpc.
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
+
+from .transport import AdapterPublisher  # noqa: E402
+
+logger = logging.getLogger("lora_trainer")
 
 
 def _enable_gradient_checkpointing(policy) -> int:
@@ -65,7 +78,7 @@ def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
     return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def build_policy(cfg: LoRALearnerConfig):
+def build_policy(cfg: LoRATrainerConfig):
     """Load the base policy exactly as the policy server does, then wrap it in LoRA.
 
     Returns ``(policy, peft_model)``. ``get_peft_model`` injects the adapter layers
@@ -118,7 +131,7 @@ def build_policy(cfg: LoRALearnerConfig):
     return policy, peft_model
 
 
-def build_dataloader(cfg: LoRALearnerConfig, policy) -> DataLoader:
+def build_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
     """LeRobot dataset windowed into action chunks the policy's loss can consume."""
     meta = LeRobotDatasetMetadata(cfg.dataset_repo_id, root=cfg.dataset_root)
     delta_timestamps = resolve_delta_timestamps(policy.config, meta)
@@ -144,11 +157,16 @@ def build_dataloader(cfg: LoRALearnerConfig, policy) -> DataLoader:
 
 
 @draccus.wrap()
-def train(cfg: LoRALearnerConfig):
+def train(cfg: LoRATrainerConfig):
+    # force=True: lerobot's import installs a root WARNING handler; without force this
+    # basicConfig is a no-op and all INFO training logs below are swallowed.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
     )
+    # Silence PI05's per-image resize_with_pad_torch warning (fires every forward).
+    logging.getLogger("lerobot.policies.pi05.modeling_pi05").setLevel(logging.ERROR)
     logger.info(pformat(asdict(cfg)))
 
     set_seed(cfg.seed)
@@ -179,15 +197,16 @@ def train(cfg: LoRALearnerConfig):
         optimizer, lambda s: _lr_lambda(s, cfg.warmup_steps, cfg.steps)
     )
 
-    adapter_dir = Path(cfg.adapter_dir).expanduser()
-    version = next_version(adapter_dir)
+    publisher = AdapterPublisher(host=cfg.serve_host, port=cfg.serve_port)
+    publisher.start()
+    version = 1
 
     if cfg.publish_at_start:
-        # LoRA initializes B=0, so this adapter is an exact identity. Publishing it
-        # up front lets the server inject the adapter layers once, during a quiet
-        # moment, and makes every later update a cheap in-place weight swap.
-        meta = publish_adapter(peft_model, adapter_dir, version, step=0, keep_last=cfg.keep_last)
-        logger.info(f"Published identity adapter v{meta.version} -> {meta.path(adapter_dir)}")
+        # LoRA initializes B=0, so this adapter is an exact identity. Serving it up
+        # front lets the policy server inject the adapter layers once, on its first
+        # pull during a quiet moment, and makes every later update a cheap weight swap.
+        meta = publisher.publish(peft_model, version, step=0)
+        logger.info(f"Published identity adapter v{meta.version}")
         version += 1
 
     autocast = torch.autocast(
@@ -201,6 +220,18 @@ def train(cfg: LoRALearnerConfig):
     running_loss = 0.0
     loss_count = 0
     step_start = time.perf_counter()
+
+    # One bar per publish cycle: fills 0 -> publish_freq, then resets on each publish
+    # so you can see how far off the next adapter is. Overall step is in the postfix.
+    def _cycle_total(done: int) -> int:
+        return min(cfg.publish_freq, cfg.steps - done)
+
+    pbar = tqdm(
+        total=_cycle_total(0),
+        desc=f"train -> v{version}",
+        unit="step",
+        dynamic_ncols=True,
+    )
 
     for step in range(1, cfg.steps + 1):
         optimizer.zero_grad(set_to_none=True)
@@ -229,14 +260,17 @@ def train(cfg: LoRALearnerConfig):
         )
         optimizer.step()
         scheduler.step()
+        pbar.update(1)
 
         if step % cfg.log_freq == 0:
             avg_loss = running_loss / max(loss_count, 1)
             dt = (time.perf_counter() - step_start) / cfg.log_freq
-            logger.info(
-                f"step {step}/{cfg.steps} | loss {avg_loss:.4f} | "
-                f"grad_norm {float(grad_norm):.3f} | lr {scheduler.get_last_lr()[0]:.2e} | "
-                f"{dt:.3f}s/step"
+            pbar.set_postfix(
+                step=f"{step}/{cfg.steps}",
+                loss=f"{avg_loss:.4f}",
+                grad=f"{float(grad_norm):.2f}",
+                lr=f"{scheduler.get_last_lr()[0]:.1e}",
+                s_step=f"{dt:.2f}",
             )
             running_loss = 0.0
             loss_count = 0
@@ -244,21 +278,23 @@ def train(cfg: LoRALearnerConfig):
 
         if step % cfg.publish_freq == 0:
             avg_loss = running_loss / loss_count if loss_count else None
-            meta = publish_adapter(
-                peft_model,
-                adapter_dir,
-                version=version,
-                step=step,
-                loss=avg_loss,
-                keep_last=cfg.keep_last,
-            )
-            logger.info(f"Published adapter v{meta.version} (step {step}) -> {meta.path(adapter_dir)}")
+            meta = publisher.publish(peft_model, version=version, step=step, loss=avg_loss)
+            tqdm.write(f"Published adapter v{meta.version} (step {step})")
             version += 1
+            if step < cfg.steps:  # start a fresh bar for the next publish cycle
+                pbar.reset(total=_cycle_total(step))
+                pbar.set_description(f"train -> v{version}")
 
-    meta = publish_adapter(
-        peft_model, adapter_dir, version=version, step=cfg.steps, keep_last=cfg.keep_last
-    )
-    logger.info(f"Training done. Final adapter v{meta.version} -> {meta.path(adapter_dir)}")
+    pbar.close()
+    meta = publisher.publish(peft_model, version=version, step=cfg.steps)
+    logger.info(f"Training done. Final adapter v{meta.version}")
+
+    # Keep serving the final adapter so a policy server can still pull it after
+    # training ends; Ctrl-C to exit.
+    try:
+        publisher.wait()
+    except KeyboardInterrupt:
+        publisher.stop()
 
 
 if __name__ == "__main__":

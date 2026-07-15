@@ -1,16 +1,17 @@
 """Variant of lerobot's policy_server.py that hot-reloads LoRA adapters.
 
-Identical to the stock ``PolicyServer`` except that it watches ``adapter_dir`` for
-adapters published by ``learner.py`` and swaps them into the running policy
-without a restart. The base policy is loaded once, at handshake, exactly as
-before; only the adapter weights (a few MB) are ever reloaded.
+Identical to the stock ``PolicyServer`` except that it pulls LoRA adapters from a
+remote trainer's gRPC ``AdapterService`` (see ``transport/client.py``) and swaps each
+one into the running policy without a restart. The base policy is loaded once, at
+handshake, exactly as before; only the adapter weights (a few MB) are ever fetched
+and reloaded.
 
 Two things make the swap safe:
 
-* It happens at an action-chunk boundary, on the inference thread, before the
-  observation is preprocessed -- never in the middle of a forward pass.
-* The learner publishes atomically (rename-into-place), so a partially written
-  adapter is never visible here.
+* The pull-and-swap happens at an action-chunk boundary, on the inference thread,
+  before the observation is preprocessed -- never in the middle of a forward pass.
+* The client reassembles the whole adapter into a local dir before returning it, so
+  a partial adapter is never applied.
 
 Set ``reload_on=handshake`` to restrict swaps to client (re)connections, i.e.
 between episodes, if you don't want the policy changing mid-rollout.
@@ -18,7 +19,7 @@ between episodes, if you don't want the policy changing mid-rollout.
 Usage:
     python -m lora_finetuning.lora_policy_server \
         --host=0.0.0.0 --port=8080 --fps=30 \
-        --adapter_dir=/path/to/adapters \
+        --adapter_addr=trainer-host:8090 \
         --reload_on=chunk
 """
 
@@ -27,7 +28,6 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
-from pathlib import Path
 from pprint import pformat
 
 import draccus
@@ -38,8 +38,8 @@ from lerobot.async_inference.policy_server import PolicyServer
 from lerobot.transport import services_pb2_grpc  # type: ignore
 from lerobot.utils.import_utils import register_third_party_plugins
 
-from .adapter_store import AdapterVersion, AdapterWatcher
 from .configs import LoRAPolicyServerConfig
+from .transport import AdapterApplier, AdapterClient, AdapterVersion
 
 
 class LoRAPolicyServer(PolicyServer):
@@ -50,18 +50,18 @@ class LoRAPolicyServer(PolicyServer):
         super().__init__(config)
         self.config: LoRAPolicyServerConfig = config
 
-        self.adapter_root = Path(config.adapter_dir).expanduser() if config.adapter_dir else None
-        self._watcher = AdapterWatcher(self.adapter_root) if self.adapter_root else None
-        self._peft_model = None
+        self._applier = AdapterApplier(device=str(self.device))
         self._adapter_lock = threading.Lock()
         self.adapter_version: AdapterVersion | None = None
 
-        if self._watcher is None:
-            self.logger.info("No adapter_dir set: running as a stock PolicyServer (no hot-reload)")
-        else:
+        if config.adapter_addr:
+            self._client = AdapterClient(config.adapter_addr, root=config.adapter_cache_dir)
             self.logger.info(
-                f"Watching {self.adapter_root} for LoRA adapters (reload_on={config.reload_on})"
+                f"Pulling LoRA adapters from {config.adapter_addr} (reload_on={config.reload_on})"
             )
+        else:
+            self._client = None
+            self.logger.info("No adapter_addr set: running as a stock PolicyServer (no hot-reload)")
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """Load the base policy (stock behavior), then attach the current adapter."""
@@ -76,11 +76,15 @@ class LoRAPolicyServer(PolicyServer):
         return super()._predict_action_chunk(observation_t)
 
     def _sync_adapter(self) -> None:
-        """Load a newer adapter if the learner has published one. Never raises."""
-        if self._watcher is None or self.policy is None:
+        """Pull the latest adapter and apply it if the trainer has a newer one. Never raises.
+
+        This is where the client chooses *when* to ask: it runs at every action-chunk
+        boundary (reload_on=chunk) or only on (re)connect (reload_on=handshake).
+        """
+        if self._client is None or self.policy is None:
             return
 
-        meta = self._watcher.poll()
+        meta = self._client.fetch()
         if meta is None:
             return
 
@@ -91,44 +95,26 @@ class LoRAPolicyServer(PolicyServer):
                 # A bad adapter must not take the robot down: keep serving the
                 # weights we already have. mark_loaded is skipped, so a later
                 # (fixed) publish will be retried.
-                self.logger.error(f"Failed to load adapter v{meta.version} from {meta.path(self.adapter_root)}: {e}")
+                self.logger.error(f"Failed to load adapter v{meta.version} from {meta.local_dir}: {e}")
                 return
 
-            self._watcher.mark_loaded(meta)
+            self._client.mark_loaded(meta)
             self.adapter_version = meta
 
     def _apply_adapter(self, meta: AdapterVersion) -> None:
-        from peft import PeftModel, load_peft_weights, set_peft_model_state_dict
-
-        adapter_path = str(meta.path(self.adapter_root))
         start = time.perf_counter()
-
-        if self._peft_model is None:
-            # First adapter: inject the LoRA layers into the live policy. PEFT
-            # rewrites the targeted submodules in place, so self.policy keeps
-            # working and now routes through the adapters.
-            self._peft_model = PeftModel.from_pretrained(self.policy, adapter_path, is_trainable=False)
-            self._peft_model.eval()
-            self.policy.eval()
-            action = "injected"
-        else:
-            # Steady state: overwrite adapter tensors, touching nothing else.
-            state_dict = load_peft_weights(adapter_path, device=str(self.device))
-            result = set_peft_model_state_dict(self._peft_model, state_dict)
-            unexpected = getattr(result, "unexpected_keys", None)
-            if unexpected:
-                self.logger.warning(f"Adapter v{meta.version} had unexpected keys: {unexpected}")
-            action = "swapped"
-
+        action = self._applier.apply(self.policy, meta.local_dir, version=meta.version)
         elapsed = (time.perf_counter() - start) * 1000
         self.logger.info(
-            f"LoRA adapter v{meta.version} {action} (learner step {meta.step}, "
+            f"LoRA adapter v{meta.version} {action} (trainer step {meta.step}, "
             f"loss {meta.loss if meta.loss is not None else float('nan'):.4f}) in {elapsed:.0f}ms"
         )
 
 
 @draccus.wrap()
 def serve(cfg: LoRAPolicyServerConfig):
+    # Silence PI05's per-image resize_with_pad_torch warning (fires every forward).
+    logging.getLogger("lerobot.policies.pi05.modeling_pi05").setLevel(logging.ERROR)
     logging.info(pformat(asdict(cfg)))
 
     policy_server = LoRAPolicyServer(cfg)
