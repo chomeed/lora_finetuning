@@ -16,14 +16,23 @@ Usage (in trainer.py):
 """
 
 import logging
+import os
+import shutil
 import threading
 import time
 from concurrent import futures
+from pathlib import Path
 
 import grpc
 
 from . import service_pb2_grpc as pb_grpc
-from .wire import AdapterVersion, iter_chunks, serialize_adapter
+from .wire import (
+    ADAPTER_CONFIG_FILE,
+    ADAPTER_WEIGHTS_FILE,
+    AdapterVersion,
+    iter_chunks,
+    serialize_adapter,
+)
 
 logger = logging.getLogger("lora_adapter_publisher")
 
@@ -59,6 +68,23 @@ class _AdapterServicer(pb_grpc.AdapterServiceServicer):
         logger.info(f"Served adapter v{meta.version} to {context.peer()}")
 
 
+def _save_adapter(root: str | os.PathLike, version: int, config_json: str, weights: bytes) -> Path:
+    """Write one adapter to ``<root>/v00000N/`` atomically (tmp dir + rename), so
+    a crash mid-write can never leave a half-saved dir that resume would load."""
+    root = Path(root)
+    dest = root / f"v{version:06d}"
+    tmp = root / f".v{version:06d}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True)
+    (tmp / ADAPTER_CONFIG_FILE).write_text(config_json or "{}")
+    (tmp / ADAPTER_WEIGHTS_FILE).write_bytes(weights)
+    if dest.exists():
+        shutil.rmtree(dest)  # re-publish of the same version replaces it
+    os.replace(tmp, dest)
+    return dest
+
+
 class AdapterPublisher:
     def __init__(self, host: str = "0.0.0.0", port: int = 8090, max_workers: int = 4):
         self._addr = f"{host}:{port}"
@@ -82,8 +108,13 @@ class AdapterPublisher:
         version: int,
         step: int,
         loss: float | None = None,
+        save_dir: str | os.PathLike | None = None,
     ) -> AdapterVersion:
-        """Serialize ``peft_model``'s adapter and make it the one the server serves."""
+        """Serialize ``peft_model``'s adapter and make it the one the server serves.
+
+        ``save_dir`` additionally writes a durable copy to ``<save_dir>/v00000N/``
+        (the layout ``--resume_adapter_path`` loads); without it the adapter only
+        exists in this process's memory. A failed save never blocks publishing."""
         config_json, weights = serialize_adapter(peft_model)
         meta = AdapterVersion(
             version=version,
@@ -94,6 +125,12 @@ class AdapterPublisher:
         )
         self._servicer.set_latest(meta, weights)
         logger.info(f"Published adapter v{version} (step {step}, {len(weights) / 1e6:.1f}MB)")
+        if save_dir:
+            try:
+                dest = _save_adapter(save_dir, version, config_json, weights)
+                logger.info(f"Saved adapter v{version} -> {dest}")
+            except OSError as e:
+                logger.warning(f"could not save adapter v{version} to {save_dir}: {e}")
         return meta
 
     def wait(self) -> None:

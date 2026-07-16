@@ -110,6 +110,15 @@ class LoRATrainerConfig:
     log_freq: int = 50
     resume_adapter_path: str | None = None  # continue from a published adapter dir
 
+    # Durable copy of every published adapter, written as <dir>/v00000N/
+    # (adapter_config.json + adapter_model.safetensors -- the exact layout
+    # --resume_adapter_path loads). The in-memory publisher alone loses all
+    # adapters if the trainer dies. None resolves to a sibling of the dataset
+    # dir, named after it: <dagger_datasets_dir>_adapter in dagger mode, else
+    # <dataset_root>_adapter when a local dataset root is set (no local root ->
+    # saving stays off). Set to "" to disable explicitly.
+    save_adapters_dir: str | None = None
+
     # --- dagger round loop (the "lora finetuning service" behavior) --------
     # When enabled, training runs in rounds: train `publish_freq` steps on a
     # 50/50 mix of the baseline demos and the (growing) dagger dataset, publish
@@ -166,6 +175,10 @@ class LoRATrainerConfig:
                 raise ValueError(
                     f"dagger_round_size must be >= 1 when set, got {self.dagger_round_size}"
                 )
+        if self.save_adapters_dir is None:
+            base = self.dagger_datasets_dir if self.dagger_loop else self.dataset_root
+            if base:
+                self.save_adapters_dir = base.rstrip("/") + "_adapter"
 
 
 @dataclass
@@ -219,6 +232,19 @@ class RealtimeConverterConfig:
     # is the HF namespace for each round's repo_id (dir name = <task>_sirius_round<N>).
     dagger_datasets_dir: str | None = None
     repo_namespace: str = "chomeed"
+
+    # --- full-schema archival copy ------------------------------------------
+    # When `mode` projects the recording down (anything but "full"), also
+    # convert every episode with the FULL schema -- all 41 state / 19 action
+    # channels (fingertip F/T sensors, head, lift, both arms/grippers) and all
+    # cameras -- into a parallel dataset tree named after the target with a
+    # `_full` suffix: <dagger_datasets_dir>_full (round mode, same round dir
+    # names inside) or <dataset_root>_full / <dataset_repo_id>_full (single).
+    # The projected dataset remains the training target; the full tree is the
+    # archival original, so a projected dataset can always be regenerated with
+    # a different mode later. Roughly doubles conversion CPU (a second video
+    # encode). No effect when mode="full".
+    keep_full_copy: bool = True
 
     # --- episode cap -------------------------------------------------------
     # ROUND mode: episodes per round before rolling to the next dataset.

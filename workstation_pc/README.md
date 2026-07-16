@@ -42,6 +42,13 @@ ws-real-time-converter \
 (`/tmp/lora_policy_version.json`), so adapter-version tagging works with no
 extra flags; pass `--policy_status_file=""` to disable.
 
+Because `--mode` projects the recording down, the converter also archives every
+episode **unprojected** (full 41-D state / 19-D action: fingertip F/T, head,
+lift, both arms) into a parallel tree next to the target:
+`<dagger_datasets_dir>_full/<task>_sirius_round<N>` (or `<dataset_root>_full` in
+single mode). A projected dataset can then be regenerated with a different mode
+later. `--keep_full_copy=false` disables it; no effect when `--mode=full`.
+
 Writes `board_insertion_sirius_round1`, and every `--num_demos` episodes rolls
 over to `…_round2`, `…_round3`, … continuously. `--mode` projects the full-rig
 recording to the policy's I/O schema (see [common/schema.py](../common/schema.py)).
@@ -61,6 +68,12 @@ ws-lora-finetuning \
     --serve_host=127.0.0.1 --serve_port=8090 --publish-freq 50 \
     --lora_variant small
 ```
+
+Every published adapter is also saved durably to
+`<dagger_datasets_dir>_adapter/v00000N/` (`adapter_config.json` +
+`adapter_model.safetensors` — the layout `--resume_adapter_path` loads), since
+the in-memory publisher alone loses all adapters if the trainer dies. Override
+with `--save_adapters_dir`, or `--save_adapters_dir=""` to disable.
 
 Each round: rebuild a `SIRIUSDataset` mix of the baseline demos (all frames) +
 every `*_sirius_round*` dataset's **intervention transitions** at

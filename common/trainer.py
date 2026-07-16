@@ -400,7 +400,8 @@ def _run_dagger_loop(cfg, policy, peft_model, preprocessor, publisher, autocast,
 
         # 5. publish this round's adapter, then loop back to wait for more data.
         avg = round_loss / round_n if round_n else None
-        meta = publisher.publish(peft_model, version=version, step=global_step, loss=avg)
+        meta = publisher.publish(peft_model, version=version, step=global_step, loss=avg,
+                                 save_dir=cfg.save_adapters_dir)
         logger.info(
             f"round {round_idx}: published adapter v{meta.version} "
             f"(step {global_step}, {have} dagger episode(s), loss "
@@ -451,7 +452,7 @@ def train(cfg: LoRATrainerConfig):
         # LoRA initializes B=0, so this adapter is an exact identity. Serving it up
         # front lets the policy server inject the adapter layers once, on its first
         # pull during a quiet moment, and makes every later update a cheap weight swap.
-        meta = publisher.publish(peft_model, version, step=0)
+        meta = publisher.publish(peft_model, version, step=0, save_dir=cfg.save_adapters_dir)
         logger.info(f"Published identity adapter v{meta.version}")
         version += 1
 
@@ -552,7 +553,8 @@ def train(cfg: LoRATrainerConfig):
 
         if step % cfg.publish_freq == 0:
             avg_loss = running_loss / loss_count if loss_count else None
-            meta = publisher.publish(peft_model, version=version, step=step, loss=avg_loss)
+            meta = publisher.publish(peft_model, version=version, step=step, loss=avg_loss,
+                                     save_dir=cfg.save_adapters_dir)
             tqdm.write(f"Published adapter v{meta.version} (step {step})")
             version += 1
             if step < cfg.steps:  # start a fresh bar for the next publish cycle
@@ -560,7 +562,7 @@ def train(cfg: LoRATrainerConfig):
                 pbar.set_description(f"train -> v{version}")
 
     pbar.close()
-    meta = publisher.publish(peft_model, version=version, step=cfg.steps)
+    meta = publisher.publish(peft_model, version=version, step=cfg.steps, save_dir=cfg.save_adapters_dir)
     logger.info(f"Training done. Final adapter v{meta.version}")
 
     # Keep serving the final adapter so a policy server can still pull it after

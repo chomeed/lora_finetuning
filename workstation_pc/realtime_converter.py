@@ -66,7 +66,7 @@ import subprocess
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace as dc_replace
 from pathlib import Path
 from pprint import pformat
 
@@ -82,7 +82,7 @@ from ..common.hdf5_episode import (
     read_episode_arrays,
 )
 from ..common.manifest import DaggerManifest, ManifestEntry, read_policy_status
-from ..common.schema import ACTION_KEYS, STATE_KEYS, get_schema, projection_indices
+from ..common.schema import ACTION_KEYS, STATE_KEYS, get_schema, projection_indices, resolve_mode
 
 logger = logging.getLogger("realtime_converter")
 
@@ -218,6 +218,35 @@ class RealtimeConverter:
             self.rounds_dir = None
             self.round_idx = None
         self._set_round_target()
+
+        # ── full-schema archival copy ───────────────────────────────────
+        # When the mode projects the recording down, ALSO convert every episode
+        # with the "full" schema (all 41 state / 19 action channels incl. the
+        # fingertip F/T sensors and head/lift, all cameras) into a parallel tree
+        # named after the target with a `_full` suffix: <dagger_datasets_dir>_full
+        # (round mode) or <dataset_root>_full (single). The projected dataset
+        # stays the training target and owns the queue; the full copy is the
+        # archival original and never blocks delivery.
+        self.full_converter = None
+        if cfg.keep_full_copy and resolve_mode(cfg.mode) != "full":
+            if self.round_mode:
+                full_cfg = dc_replace(
+                    cfg,
+                    mode="full",
+                    keep_full_copy=False,  # no recursion
+                    verify_checksum=False,  # the primary already verified the file
+                    dagger_datasets_dir=cfg.dagger_datasets_dir.rstrip("/") + "_full",
+                )
+            else:
+                full_cfg = dc_replace(
+                    cfg,
+                    mode="full",
+                    keep_full_copy=False,
+                    verify_checksum=False,
+                    dataset_root=cfg.dataset_root.rstrip("/") + "_full",
+                    dataset_repo_id=cfg.dataset_repo_id + "_full",
+                )
+            self.full_converter = RealtimeConverter(full_cfg)
 
     # -- round targeting --
     def _round_dirname(self, n: int) -> str:
@@ -501,6 +530,29 @@ class RealtimeConverter:
         )
         return n_rows
 
+    def _convert_full_copy(self, path: Path) -> None:
+        """Archive one episode into the full-schema tree, after the projected
+        conversion succeeded. Runs BEFORE the source is deleted. A failure here
+        must not fail the file (retrying would duplicate the already-written
+        projected episode), so it is logged and the full tree just misses one."""
+        fc = self.full_converter
+        try:
+            t0 = time.perf_counter()
+            n = fc._convert_one(path)
+            logger.info(
+                f"archived full-schema copy of {path.name}: {n} frames in "
+                f"{time.perf_counter() - t0:.1f}s -> {fc.root}"
+            )
+        except Exception as e:
+            logger.error(
+                f"full-schema copy FAILED for {path.name}: {e} -- the projected "
+                f"dataset already has it; {fc.root} will be missing this episode"
+            )
+            return
+        # Keep the full tree's rounds rolling in lockstep with the primary's.
+        if fc.round_mode and fc._dataset_episode_count() >= fc.cfg.num_demos:
+            fc._advance_round()
+
     # -- main loop --
     def run(self) -> int:
         apply_process_priority(self.cfg.nice, self.cfg.ionice_idle)
@@ -512,10 +564,20 @@ class RealtimeConverter:
                 f"{self.rounds_dir} ({self.cfg.num_demos} episodes/round, {mode_desc}); "
                 f"resuming at round {self.round_idx}: {self.repo_id}"
             )
+            if self.full_converter is not None:
+                logger.info(
+                    f"also archiving full-schema (unprojected) copies under "
+                    f"{self.full_converter.rounds_dir}"
+                )
         else:
             logger.info(
                 f"watching {self.ingest_dir}/{self.cfg.glob} -> {self.repo_id} ({mode_desc})"
             )
+            if self.full_converter is not None:
+                logger.info(
+                    f"also archiving full-schema (unprojected) copies to "
+                    f"{self.full_converter.root}"
+                )
             if self.cfg.num_demos is not None:
                 have = self._dataset_episode_count()
                 if have >= self.cfg.num_demos:
@@ -554,6 +616,10 @@ class RealtimeConverter:
                 if n == 0:  # filtered / empty -> quarantine so we don't rescan it forever
                     self._move_source(path, self.failed_dir)
                     continue
+                # Archive the unprojected original next to the target (must
+                # happen while the source file still exists).
+                if self.full_converter is not None:
+                    self._convert_full_copy(path)
                 # Success: the episode is a durable checkpoint; drop the raw source.
                 # (The robot keeps its own copy of the recording.)
                 if self.cfg.delete_on_success:
