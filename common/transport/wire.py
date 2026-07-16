@@ -145,6 +145,11 @@ class AdapterAssembler:
         dest.mkdir(parents=True, exist_ok=True)
         (dest / ADAPTER_CONFIG_FILE).write_text(meta.config_json or "{}")
         (dest / ADAPTER_WEIGHTS_FILE).write_bytes(weights)
+        # Track each dir once and keep the freshly-written one newest. Re-fetching
+        # the same version (e.g. the server retrying a failed load) must not append
+        # a duplicate -- otherwise cleanup() would rmtree the dir we just returned.
+        if dest in self._dirs:
+            self._dirs.remove(dest)
         self._dirs.append(dest)
         return replace(meta, local_dir=str(dest))
 

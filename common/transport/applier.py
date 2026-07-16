@@ -17,6 +17,16 @@ class AdapterApplier:
         self.device = device
         self.peft_model = None
 
+    def _resolve_device(self) -> str:
+        """The device to load adapter tensors onto. Prefer the live model's own
+        device (the policy may have moved to CUDA after this applier was built);
+        fall back to the configured device, never the literal string "None"."""
+        try:
+            return str(next(self.peft_model.parameters()).device)
+        except (StopIteration, AttributeError):
+            pass
+        return "cpu" if self.device in (None, "None") else str(self.device)
+
     def apply(self, policy, adapter_path: str, version: int | None = None) -> str:
         """Apply the adapter at ``adapter_path`` to ``policy``. Returns "injected"/"swapped"."""
         from peft import PeftModel, load_peft_weights, set_peft_model_state_dict
@@ -30,7 +40,8 @@ class AdapterApplier:
             return "injected"
 
         # Steady state: overwrite adapter tensors, touching nothing else.
-        state_dict = load_peft_weights(adapter_path, device=str(self.device))
+        device = self._resolve_device()
+        state_dict = load_peft_weights(adapter_path, device=device)
         result = set_peft_model_state_dict(self.peft_model, state_dict)
         unexpected = getattr(result, "unexpected_keys", None)
         if unexpected:

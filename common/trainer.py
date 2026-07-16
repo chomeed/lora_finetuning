@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -172,30 +173,77 @@ def build_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
 
 
 # ── DAgger round loop ──────────────────────────────────────────────────────
+def _round_index(rid: str) -> int:
+    """Trailing integer in a round dir name (``..._sirius_round7`` -> 7), so rounds
+    sort numerically -- plain string sort would put round10 before round2."""
+    m = re.search(r"(\d+)\D*$", rid)
+    return int(m.group(1)) if m else -1
+
+
 def _discover_dagger_rounds(cfg: LoRATrainerConfig) -> list[tuple[str, Path]]:
-    """The per-round dagger datasets present under ``dagger_datasets_dir``, sorted
-    (e.g. board_insertion_sirius_round1, ..._round2). Returns (repo_id, root)
-    pairs, repo_id = the directory name. Only dirs with a finalized info.json
-    count, so a half-written round is ignored until it's a valid dataset."""
+    """The per-round dagger datasets present under ``dagger_datasets_dir``, in
+    round order (e.g. ..._sirius_round1, ..._round2, ..._round10). Returns
+    (repo_id, root) pairs, repo_id = the directory name. Only dirs with a
+    finalized info.json count, so a half-written round is ignored until valid."""
     parent = Path(cfg.dagger_datasets_dir)
     rounds = []
     if parent.exists():
-        for d in sorted(parent.glob(cfg.dagger_dataset_glob)):
+        for d in parent.glob(cfg.dagger_dataset_glob):
             if d.is_dir() and (d / "meta" / "info.json").exists():
                 rounds.append((d.name, d))
+    rounds.sort(key=lambda rp: (_round_index(rp[0]), rp[0]))
     return rounds
+
+
+def _round_episode_count(root: Path) -> int:
+    """Episodes in one dagger round dir (0 if its info.json is missing/unreadable)."""
+    try:
+        return int(json.loads((root / "meta" / "info.json").read_text()).get("total_episodes", 0))
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return 0
 
 
 def _dagger_total_episodes(cfg: LoRATrainerConfig) -> int:
     """Total episodes across every dagger round dir -- grows both when the
     current round gains episodes and when a new round appears."""
-    total = 0
-    for _, root in _discover_dagger_rounds(cfg):
-        try:
-            total += int(json.loads((root / "meta" / "info.json").read_text()).get("total_episodes", 0))
-        except (json.JSONDecodeError, OSError, ValueError, TypeError):
-            pass
-    return total
+    return sum(_round_episode_count(root) for _, root in _discover_dagger_rounds(cfg))
+
+
+def _inferred_round_size(rounds: list[tuple[str, Path]]) -> int:
+    """Auto-sync with the converter's --num_demos WITHOUT being told it: any round
+    the converter has already rolled past (a higher-indexed round exists) is full,
+    so its episode count == num_demos. Take the max over those known-full rounds.
+    0 until at least one round has a successor (can't know the size before then)."""
+    if not rounds:
+        return 0
+    max_idx = max(_round_index(rid) for rid, _ in rounds)
+    full = [root for rid, root in rounds if _round_index(rid) < max_idx]
+    return max((_round_episode_count(r) for r in full), default=0)
+
+
+def _complete_dagger_rounds(cfg: LoRATrainerConfig) -> list[tuple[str, Path]]:
+    """Dagger rounds to actually train on: only those the converter has finalized,
+    so a still-filling current round is excluded until it's full.
+
+    Round size comes from ``dagger_round_size`` if set, else it's inferred from
+    disk (the size of rounds the converter already rolled past). A round counts as
+    complete when it has a successor round OR its episode count reaches that size
+    -- the latter also catches a finished *final* round after the converter stops."""
+    rounds = _discover_dagger_rounds(cfg)
+    if not rounds:
+        return []
+    size = cfg.dagger_round_size or _inferred_round_size(rounds)
+    max_idx = max(_round_index(rid) for rid, _ in rounds)
+    return [
+        (rid, root) for rid, root in rounds
+        if _round_index(rid) < max_idx or (size and _round_episode_count(root) >= size)
+    ]
+
+
+def _dagger_progress(cfg: LoRATrainerConfig) -> int:
+    """The quantity the round loop waits to *increase* before starting a round:
+    the number of completed dagger rounds (train once per finalized round)."""
+    return len(_complete_dagger_rounds(cfg))
 
 
 def build_dagger_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
@@ -215,16 +263,27 @@ def build_dagger_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
 
     meta = LeRobotDatasetMetadata(cfg.baseline_dataset_repo_id, root=cfg.baseline_dataset_root)
     delta_timestamps = resolve_delta_timestamps(policy.config, meta)
-    rounds = _discover_dagger_rounds(cfg)
+    rounds = _complete_dagger_rounds(cfg)
     # baseline (demo) first, then dagger rounds in order -- SIRIUS's curriculum
     # indexing expects the demo dataset(s) and the daggers in round order.
     repo_ids = [cfg.baseline_dataset_repo_id, *[rid for rid, _ in rounds]]
-    roots = {cfg.baseline_dataset_repo_id: cfg.baseline_dataset_root}
+    # Only pin an explicit baseline root when one was given; otherwise leave it
+    # out so SIRIUSDataset resolves it from the HF cache (matches the root=None
+    # handling of LeRobotDatasetMetadata above -- a None here would Path(None)-crash).
+    roots = {}
+    if cfg.baseline_dataset_root:
+        roots[cfg.baseline_dataset_repo_id] = cfg.baseline_dataset_root
     roots.update({rid: str(root) for rid, root in rounds})
     ds = SIRIUSDataset(
         repo_ids=repo_ids,
         roots=roots,
         p_intv=cfg.dagger_sampling_ratio,
+        # Pin P*(demo) to the complement so the mix is a fixed
+        # dagger_sampling_ratio split (0.5 -> 50/50 demo/intervention),
+        # upsampling the small intervention class. Leaving it None makes it the
+        # *empirical* demo fraction, which with a large baseline (P(demo)~0.87)
+        # blows past p_intv + p_demo <= 1 and raises before training can start.
+        p_demo=1.0 - cfg.dagger_sampling_ratio,
         p_preintv=0.0,
         p_robot_max=0.0,  # only the intervention transitions from the dagger data
         use_recomputed_stats=False,  # freeze normalization to the baseline demo stats
@@ -253,23 +312,25 @@ def _run_dagger_loop(cfg, policy, peft_model, preprocessor, publisher, autocast,
     )
     unbounded = cfg.steps <= 0
     global_step = 0
-    trained_through = 0  # dagger episode count the last round trained on
+    # number of completed dagger rounds the last training round trained through.
+    trained_through = 0
     round_idx = 0
     policy.train()
 
     while unbounded or global_step < cfg.steps:
-        # 1. wait for the converter to add new dagger episodes / a new round.
-        have = _dagger_total_episodes(cfg)
+        # 1. wait for the converter to finalize a new round (dagger_round_size)
+        #    or add new dagger episodes (legacy).
+        have = _dagger_progress(cfg)
         announced = False
         while have <= trained_through or have == 0:
             if not announced:
                 logger.info(
-                    f"round {round_idx}: waiting for new dagger episodes "
+                    f"round {round_idx}: waiting for a completed dagger round "
                     f"(have {have}, trained through {trained_through})..."
                 )
                 announced = True
             time.sleep(cfg.wait_poll_s)
-            have = _dagger_total_episodes(cfg)
+            have = _dagger_progress(cfg)
 
         # 2. rebuild the mixed loader over baseline + all dagger rounds so far.
         try:

@@ -333,13 +333,16 @@ class RealtimeConverter:
 
     def _open_writer(self, ep: dict):
         """Create the dataset on the first episode, else resume for appending."""
+        from lerobot.configs.video import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         # Streaming knobs are shared by create() and resume(); with streaming on,
         # frames are encoded as they're added (no temp PNGs, encode overlaps decode).
+        # The codec moved from a bare ``vcodec=`` kwarg into RGBEncoderConfig; keep
+        # our configured codec (libsvtav1/AV1), let quality/pix_fmt default.
         stream_kwargs = dict(
             streaming_encoding=self.cfg.streaming_encoding,
-            vcodec=self.cfg.vcodec,
+            rgb_encoder=RGBEncoderConfig(vcodec=self.cfg.vcodec),
             encoder_queue_maxsize=self.cfg.encoder_queue_maxsize,
             encoder_threads=self.cfg.encoder_threads,
         )
