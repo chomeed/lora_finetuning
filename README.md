@@ -1,261 +1,162 @@
 # lora_finetuning
 
 On-the-fly LoRA fine-tuning of a base policy (PI05), served through LeRobot's async
-inference stack **without restarting the policy server**.
+inference stack **without restarting the policy server** — wired into a live DAgger
+(SIRIUS) loop: the robot streams corrected rollouts to the workstation, which
+converts them, trains a LoRA adapter on them, and hot-swaps it into the running
+policy.
 
-Two processes connected by gRPC — they can run on different machines, no shared
-filesystem required. It's a **pull** model: the client asks for params when it wants them.
+## Layout (by machine)
 
 ```
-trainer.py            --serve_port=8090      trains LoRA adapters on a LeRobot dataset,
-(hosts AdapterService)                       keeps the latest version in memory
-                              ▲
-      GetLatestAdapter(have_version=N)  │   client asks on its own schedule
-      ← latest adapter if newer, else   │   (empty reply when nothing new → cheap)
-        empty stream                    ▼
-lora_policy_server.py --adapter_addr=HOST:8090   pulls the latest adapter, materializes it
-(pulls from the trainer)                         into a local temp dir, swaps it in-place at
-                                                 action-chunk boundaries (or on handshake)
+robot_pc/         the Orin — pushes recorded episodes to the workstation queue
+workstation_pc/   rllab4 — policy server + realtime HDF5→LeRobot converter + LoRA trainer
+common/           shared library: configs, trainer/policy-server cores, obs/action
+                  schema, dagger manifest, and the gRPC adapter transport
 ```
 
-Each version is ~5 MB (adapter only, never the 4.1B base): chunked safetensors +
-`adapter_config.json`, inline. The trainer just holds the current adapter; **it never
-pushes** — bytes move only when the client requests and a newer version exists.
+The **same** trainer/policy-server code runs on a remote GPU box too — bind
+`--serve_host=0.0.0.0` instead of loopback; there is no separate remote package.
+Install once (registers the console-script shortcuts): from this directory,
 
-LeRobot's own `policy_server.py` is **not modified**. `LoRAPolicyServer` subclasses
-`PolicyServer` and overrides two methods.
+```bash
+pip install -e .
+```
+
+| Shortcut | Runs on | What |
+|---|---|---|
+| `robot-demo-sending` | robot | rsync finished episodes → workstation `tmp_demo` queue |
+| `ws-real-time-converter` | workstation | HDF5 → LeRobot, `--mode` projection, intervention + manifest, sirius-round rollover |
+| `ws-lora-finetuning` | workstation / remote | LoRA trainer; single-shot or the `--dagger_loop` service |
+| `ws-serve-policy` | workstation / remote | policy server that pulls + hot-swaps adapters |
+
+Both hyphen and underscore flag spellings are accepted (`--num-demos` == `--num_demos`).
+See [robot_pc/](robot_pc/README.md) and [workstation_pc/](workstation_pc/README.md)
+for per-role usage.
+
+## The loop
+
+```
+robot_pc:  robot-demo-sending ──rsync──▶ tmp_demo/            (the queue)
+workstation:
+  ws-real-time-converter  tmp_demo/ ──▶ <task>_sirius_round1, round2, …  (N eps/round)
+  ws-lora-finetuning --dagger_loop  ◀── watches the rounds; each round trains a
+        50/50 mix of baseline demos and dagger *intervention* transitions (SIRIUS),
+        publishes an adapter over gRPC, resets the LR, waits for the next round
+  ws-serve-policy  ◀── pulls the latest adapter and swaps it in at a chunk boundary
+```
+
+The adapter transport is a **pull** model: the trainer hosts an `AdapterService`
+and holds the latest adapter; the policy server asks for it when it wants it
+(every action-chunk boundary, or only between episodes). Each version is ~5 MB
+(adapter only, never the 4.1B base): chunked safetensors + `adapter_config.json`.
+`LoRAPolicyServer` subclasses LeRobot's `PolicyServer` and overrides two methods;
+LeRobot's own `policy_server.py` is not modified.
 
 ## Why this shape
 
-This is the base-policy fine-tuning leg of [EXPO](https://arxiv.org/abs/2507.07986).
-EXPO keeps a large expressive base policy and a lightweight edit/residual policy on
-top; the residual is trained with RL, and the base is *continuously fine-tuned with a
-plain imitation objective* on the replay buffer. No value weighting, no backprop from
-Q into the base. The improvement comes from *which* actions end up in the data — if
-you train on value-improved (edited / corrected / successful) rollouts, the base
-distills toward them and the residual has less work to do over time.
+This is the base-policy fine-tuning leg of [EXPO](https://arxiv.org/abs/2507.07986):
+keep a large expressive base policy and continuously fine-tune it with a plain
+imitation objective on the improving replay buffer. The trainer is deliberately
+dumb — it runs PI05's own flow-matching loss on a LeRobot dataset. All the value
+filtering lives upstream, in **which frames end up in the data**: here that's the
+SIRIUS weighting (`common/schema.py` picks the policy's channels; the DAgger loop
+weights human-intervention frames 50/50 against baseline demos). LoRA is what makes
+it practical: ~1.35M trainable params (0.03% of the base), so a version is small
+enough to hand to a live inference server between action chunks.
 
-So the trainer here is deliberately dumb: it runs PI05's own flow-matching loss on a
-LeRobot dataset. All the filtering lives upstream, in **which episodes you point it
-at**. LoRA is what makes it practical: the trainable set is ~1.35M params (0.03% of
-the base), so a version is ~5 MB — small enough to hand to a live inference server
-between action chunks, where a full 4.1B state dict never would be.
+## Data: the SIRIUS round datasets
 
-## Quickstart
+The converter writes `<task>_sirius_round<N>` LeRobot datasets and rolls to the
+next every `--num_demos` episodes (continuous — it never stops). Every converted
+episode carries:
 
-Both processes need the `policy_learning` conda env (it has `peft`, `torch`, and
-`lerobot` installed editable). Run from the `policy_learning/` directory.
-
-**1. Start the server** (drop-in replacement for `lerobot.async_inference.policy_server`):
-
-```bash
-python -m lora_finetuning.lora_policy_server \
-    --host=0.0.0.0 --port=8080 --fps=30 \
-    --adapter_addr=<trainer-host>:8090 \
-    --reload_on=chunk
-```
-
-It accepts every stock `PolicyServerConfig` flag. The robot client connects and sends
-`SendPolicyInstructions` exactly as before — the base policy still loads from the
-checkpoint path the client names. Omit `--adapter_addr` to run as a plain
-`PolicyServer` with no hot-reload.
-
-**2. Start the trainer**, pointed at the *same base checkpoint the client will ask the
-server to load*. It hosts the AdapterService on `--serve_port`:
-
-```bash
-python -m lora_finetuning.trainer \
-    --pretrained_path=outputs/train/<run>/pretrained_model \
-    --dataset_repo_id=chomeed/<dataset> \
-    --dataset_root=/path/to/dataset \
-    --serve_host=0.0.0.0 --serve_port=8090 \
-    --steps=20000 --batch_size=8 --lr=1e-4 --publish_freq=500
-```
-
-The trainer streams an identity adapter at step 0 (LoRA is initialized with `B=0`,
-so it provably does not change behavior), which lets the server inject the adapter
-layers once, up front. Every publish after that is a cheap in-place weight swap. When
-training finishes the trainer keeps serving the final adapter (Ctrl-C to exit), so a
-policy server can still subscribe afterward.
-
-Watch the server log for:
-
-```
-LoRA adapter v1 injected (trainer step 0, loss nan) in 412ms
-LoRA adapter v2 swapped (trainer step 500, loss 0.0431) in 38ms
-```
-
-## Feeding it live: the realtime converter
-
-`realtime_converter.py` is the workstation leg of the data loop. The robot uploads
-finished `episode_*.h5` files into an ingest directory (atomic rename from
-`.partial`, so a visible `.h5` is always complete); the converter watches that
-directory and **appends each new episode to a single growing LeRobot dataset** —
-the same dataset the trainer trains on. Point the trainer at the same
-`--dataset_root`/`--dataset_repo_id` and it picks up the new episodes on its next
-(re)start.
-
-```bash
-python -m lora_finetuning.realtime_converter \
-    --ingest_dir=/data/incoming/board_handover \
-    --dataset_repo_id=chomeed/board_handover \
-    --dataset_root=/data/lerobot/board_handover \
-    --default_task=board_handover
-```
-
-It is built to run next to a live, high-priority policy server:
-
-- **It yields.** The process is CPU-niced (`--nice`, default 15) and, best-effort,
-  IO-idle (`--ionice_idle`). More importantly it *pauses whole-episode conversion*
-  whenever the GPU is busy — `nvidia-smi` utilization at/above `--gpu_util_pause`
-  (default 60%), releasing only once it drops to `--gpu_util_resume` (40%, so a
-  server hovering near the line doesn't cause start/stop churn) — or whenever a
-  pause-file exists (`touch <ingest_dir>/.pause` to stop, `rm` to resume). If
-  `nvidia-smi` can't be read the GPU signal is ignored and the pause-file still
-  works. JPEG-decode and AV1-encode (the expensive parts) run only when clear.
-- **It is crash-safe and idempotent — the ingest dir is the queue.** A file
-  sitting in the ingest dir is pending; there is no ledger. Each episode is
-  converted, then `finalize()`d into a valid, readable checkpoint, and only
-  *then* is the source `.h5` (and its `.sha256` sidecar) **deleted** — the robot
-  keeps the raw recording. A crash mid-episode leaves the source in place, so it
-  is simply reconverted next run; nothing to keep in sync or lose. Set
-  `--delete_on_success=false` to move converted files into `ingest_dir/converted/`
-  instead of deleting them. Permanently bad episodes (unreadable, checksum
-  mismatch, schema/shape mismatch) are moved to `ingest_dir/failed/` so they
-  aren't retried on every scan rather than wedging the loop.
-- **It verifies.** If the robot drops a `<name>.sha256` sidecar next to an
-  episode, the converter checks it before converting (`--verify_checksum`, on by
-  default; a no-op when no sidecar is present).
-
-- **It streams the video encode.** With `--streaming_encoding` (default on) each
-  frame is piped into the AV1 encoder as it's decoded and added, instead of
-  writing every frame as a temp PNG and batch-encoding the whole episode at save
-  time. That removes the temp-image disk churn entirely (no lingering PNGs) and
-  spreads the encode CPU across the episode rather than bursting it at the end —
-  both of which matter when you're sharing the box with inference. On the sample
-  720p episodes this was ~6.5 s/episode vs ~56 s for the batch path. `--vcodec`
-  (default `libsvtav1`), `--encoder_queue_maxsize`, and `--encoder_threads` tune
-  it; set `--streaming_encoding=false` to fall back to batch encoding. Streaming
-  needs a system ffmpeg with the AV1 encoder built in (see `render_episodes.py`
-  in `lerobot_chomeed_datasets/` for the same requirement on the read side).
-
-`--run_once=true` converts the current backlog and exits (catch-up / testing);
-the default is to keep watching. Ctrl-C / SIGTERM finishes the current episode's
-`finalize()`, writes the ledger, and exits cleanly. See `RealtimeConverterConfig`
-in `configs.py` for the full flag list (`--poll_interval_s`, `--num_decode_workers`,
-`--task_filter`, `--glob`, etc.).
-
-The episode-reading half is a self-contained copy of the Orin-side offline
-converter (`orin_demo_collection/convert_to_lerobot.py`), vendored into
-`hdf5_episode.py` so this workstation package needs neither the ROS package nor
-its env. Keep the two in sync if the recording schema changes.
+- **`--mode` projection** — the recording is always the full rig (41-D state /
+  19-D action, head + both wrists); the converter projects it down to the policy's
+  I/O schema (`insertion_15`, `handover`, …; `full` = no projection). See
+  [common/schema.py](common/schema.py) — every mode's channels must be a subset of
+  the full layout, so projection is a pure index select.
+- **a per-frame `intervention` feature** — read from the episode's `/intervention`
+  dataset (1 = human took over). The DAgger trainer uses only these frames from the
+  dagger side of the mix.
+- **a `meta/dagger_manifest.jsonl` row** — episode index, task, policy id
+  (`--dagger_policy` or an episode attr), intervention count, and the live adapter
+  version + trainer step (from `ws-serve-policy --version_status_file`, read via the
+  converter's `--policy_status_file`). This is how the workstation knows which
+  policy version each episode was collected under.
 
 ## The base checkpoint must match
 
 The trainer and the server must load the **same** `pretrained_path`. An adapter is a
-delta against specific base weights; applying it to a different base is silently wrong,
-not an error. The server takes its base path from the robot client's
-`SendPolicyInstructions`, so it is the *client's* `--policy.path` that has to agree with
-the trainer's `--pretrained_path`.
+delta against specific base weights; applying it to a different base is silently
+wrong, not an error. Normalization always reuses the baseline checkpoint's stats
+(the trainer normalizes with the checkpoint's preprocessor, and the SIRIUS mix
+freezes to the baseline demo dataset's stats) — dataset stats are never recomputed.
 
-## When adapters get swapped in
+## LoRA targets (read before changing) and variants
 
-| `--reload_on` | Behavior |
-|---|---|
-| `chunk` (default) | Pull at every action-chunk boundary. Fastest propagation. The policy can change mid-episode. |
-| `handshake` | Pull only when a client connects/reconnects, i.e. between episodes. |
+Default PI05 targets (`PI05_LORA_TARGETS` in `common/configs.py`) — 40 modules,
+~1.35M params at `r=16`: the action expert's `self_attn.q_proj`/`v_proj` (18×2),
+`model.action_in_proj`/`action_out_proj`, and `model.time_mlp_in`/`time_mlp_out`.
+The SigLIP tower and PaliGemma trunk stay frozen. We deliberately **do not** use
+LeRobot's `_get_default_peft_targets()` — its regex is stale (targets
+`model.state_proj`, which PI05 doesn't have, and PI0's `action_time_mlp_*` names),
+so it silently skips the time MLPs. Verified: the stock regex hits 38 modules, ours
+hits 40.
 
-`--reload_on` is really *when the client pulls*. Each boundary it calls
-`GetLatestAdapter(have_version=loaded)`; if the trainer has nothing newer the reply is an
-empty stream — one small round-trip, no bytes transferred — so pulling every boundary is
-cheap. Only when a new version exists does it download and swap. The swap happens on the
-inference thread, before the observation is preprocessed, so it never lands in the middle
-of a forward pass, and the client reassembles the whole adapter into a local dir before
-applying it, so a half-received adapter is never applied. If a fetch fails the client
-returns nothing (rebuilding its channel next time) and the server keeps its current
-weights; if an adapter fails to load, same thing — it logs and keeps serving.
-
-Use `handshake` if PI05's real-time chunking (RTC) blending across a weight change
-worries you, or on hardware where a mid-rollout behavior change is unacceptable.
-
-## LoRA targets (read this before changing them)
-
-Default targets for PI05 (`PI05_LORA_TARGETS` in `configs.py`) — 40 modules, ~1.35M
-params at `r=16`:
-
-- the action expert's `self_attn.q_proj` / `v_proj` (18 layers × 2)
-- `model.action_in_proj`, `model.action_out_proj`
-- `model.time_mlp_in`, `model.time_mlp_out`
-
-The SigLIP vision tower and the PaliGemma trunk stay frozen.
-
-**We deliberately do not use LeRobot's `PI05Policy._get_default_peft_targets()`.** That
-regex is stale: it targets `model.state_proj` (PI05 has no such module — state enters as
-prefix tokens, not a projection) and `model.action_time_mlp_{in,out}` (PI0's names; PI05
-calls them `model.time_mlp_{in,out}`). Neither ever matches, so the stock default
-silently trains the time MLPs not at all. Verified against a real PI05 checkpoint: the
-stock regex hits 38 modules, ours hits 40.
-
-Override with `--lora.target_modules=...` (regex or list), `--lora.r=32`, etc.
-
-## Config reference
-
-Trainer (`--help` for the full list):
-
-| Flag | Default | Note |
-|---|---|---|
-| `--pretrained_path` | required | base checkpoint; must match what the server loads |
-| `--dataset_repo_id` / `--dataset_root` | required / None | LeRobot dataset |
-| `--serve_host` / `--serve_port` | `0.0.0.0` / 8090 | where the AdapterService binds |
-| `--episodes` | all | subset to train on — this is your value filter |
-| `--publish_freq` | 500 | steps between adapter publishes |
-| `--lora.r` / `--lora.lora_alpha` | 16 / 32 | |
-| `--gradient_checkpointing` | true | ~30% slower steps, much less VRAM |
-| `--use_amp` | true | bf16 autocast |
-| `--resume_adapter_path` | None | continue training a published adapter |
-
-Server: every stock `PolicyServerConfig` flag, plus `--adapter_addr`, `--reload_on`, and
-`--adapter_cache_dir` (where received adapters land; defaults to a temp dir). Omitting
-`--adapter_addr` makes it behave exactly like the stock `PolicyServer`.
+`--lora_variant small|medium|big` sets `lora.r`/`lora.lora_alpha` (4/8, 16/32,
+32/64) — use `small` to iterate quickly.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `trainer.py` | flow-matching BC on LoRA adapters; serves the latest version on request |
-| `realtime_converter.py` | watches an ingest dir, appends new HDF5 episodes to the growing LeRobot dataset the trainer reads; GPU/pause-file throttled, deletes each source `.h5` once converted (ingest dir is the queue) |
-| `hdf5_episode.py` | reads one recorded HDF5 episode into arrays (vendored from the Orin-side offline converter) |
-| `lora_policy_server.py` | `PolicyServer` subclass that pulls + hot-reloads adapters |
-| `example_client.py` | standalone demo client: load a base policy, pull adapters, no robot |
-| `transport/` | gRPC hand-off: `service.proto`, `wire.py` (serialize/chunk/reassemble), `publisher.py` (trainer server), `client.py` (pull client), `applier.py` (inject/swap into a live policy) |
-| `configs.py` | draccus configs + the PI05 LoRA targets |
+| `common/trainer.py` | flow-matching BC on LoRA; single-shot + the DAgger round loop; serves adapters |
+| `common/policy_server.py` | `PolicyServer` subclass that pulls + hot-reloads adapters; writes the version status file |
+| `common/schema.py` | observation/action `MODE_SCHEMAS` + full-rig `STATE_KEYS`/`ACTION_KEYS` + projection |
+| `common/hdf5_episode.py` | reads one recorded HDF5 episode (incl. `/intervention` + policy-version attrs) |
+| `common/manifest.py` | dagger manifest read/write + policy-version status file |
+| `common/configs.py` | draccus configs + PI05 LoRA targets + LoRA variants |
+| `common/transport/` | gRPC adapter hand-off: `service.proto`, `wire.py`, `publisher.py`, `client.py`, `applier.py` |
+| `workstation_pc/realtime_converter.py` | ingest daemon (mode, intervention, manifest, sirius rounds; GPU/pause throttled) |
+| `workstation_pc/{train,serve_policy}.py` | thin entrypoints over `common` |
+| `robot_pc/demo_sender.py` | stdlib-only rsync-over-SSH push into the workstation queue |
 
-Regenerate the gRPC stubs after editing `transport/service.proto` (run from
+Regenerate the gRPC stubs after editing `common/transport/service.proto` (from
 `policy_learning/`):
 
 ```bash
 python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. \
-    lora_finetuning/transport/service.proto
+    lora_finetuning/common/transport/service.proto
 ```
+
+## Converter internals (co-locating with a live policy server)
+
+The converter is built to run next to a high-priority policy server:
+
+- **It yields.** CPU-niced (`--nice`), best-effort IO-idle (`--ionice_idle`), and it
+  *pauses* whole-episode conversion whenever the GPU is busy (`nvidia-smi`
+  utilization ≥ `--gpu_util_pause`, resuming at `--gpu_util_resume` — hysteresis) or
+  a pause-file exists (`touch <ingest_dir>/.pause`).
+- **The ingest dir is the queue.** No ledger: a visible `.h5` is pending; each is
+  converted, `finalize()`d into a valid checkpoint, and only then is the source
+  deleted (`--delete_on_success=false` moves it to `converted/` instead).
+  Unconvertible episodes move to `failed/`.
+- **It verifies + streams the encode.** Optional `<name>.sha256` sidecar check;
+  streaming AV1 encode (`--streaming_encoding`, needs a system ffmpeg with
+  `libsvtav1`) pipes frames as they decode instead of buffering temp PNGs.
+
+The HDF5 read half (`common/hdf5_episode.py`) is vendored from the Orin-side
+offline converter (`orin_demo_collection/convert_to_lerobot.py`); keep them in sync
+if the recording schema changes.
 
 ## Verified
 
-- PEFT injects LoRA in place, so the server's existing `self.policy` calls route through
-  the adapter with no other changes to `PolicyServer`.
-- A freshly published adapter is an exact identity (B=0) — publishing at step 0 is safe.
-- After a hot swap, the server reproduces the trainer's policy output bit-for-bit.
-- The gRPC round-trip is byte-exact: the safetensors the subscriber writes to disk match
-  what the trainer serialized (loopback test in `transport/`).
-- The PI05 target regex matches 40 modules on a real checkpoint (1.35M params, 5.4 MB).
-
-Not yet run end-to-end against a live robot + a real training run — the loop above has
-been exercised with a stand-in model, not PI05 on GPU.
-
-## Known gaps
-
-- **Stale actions.** If you later add a residual/edit policy on top (full EXPO), note
-  that a residual is defined *relative to* the base's output. Once the base starts
-  moving, any `base_action` cached in a replay buffer goes stale. Recompute it from the
-  live base, or version-tag transitions.
-- No advantage/Q weighting. Filtering is by episode selection only.
-- Single-process trainer; no distributed training.
+- End-to-end on real dagger HDF5: `--mode` projection (e.g. `insertion_15` → 15-D
+  state / 8-D action, head + wrists), per-frame `intervention` feature written to
+  the parquet, per-episode manifest rows, and sirius-round rollover
+  (round1 fills → round2 …) with resume-at-partial-round on restart.
+- PEFT injects LoRA in place; a step-0 adapter is an exact identity (B=0); after a
+  hot swap the server reproduces the trainer's output bit-for-bit; the gRPC
+  round-trip is byte-exact.
+- Not yet run end-to-end against a live robot + a real GPU training run.

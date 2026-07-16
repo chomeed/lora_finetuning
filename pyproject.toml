@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lora_finetuning"
+version = "0.1.0"
+description = "On-the-fly LoRA fine-tuning of a base policy, organized by machine role (remote / workstation / robot)."
+requires-python = ">=3.10"
+# Runtime deps are provided by the `policy_learning` conda env (torch, lerobot,
+# peft, draccus, h5py, ...) and, on the robot, by the ROS env. Kept empty so
+# `pip install -e .` just registers the console scripts without dragging the
+# heavy stack onto a machine (e.g. the Orin) that already has what it needs.
+dependencies = []
+
+[project.scripts]
+# workstation_pc entrypoints -- the same code runs on the remote GPU box; just
+# bind --serve_host=0.0.0.0 there instead of loopback.
+ws-real-time-converter = "lora_finetuning.workstation_pc.realtime_converter:main"
+ws-lora-finetuning     = "lora_finetuning.workstation_pc.train:main"
+ws-serve-policy        = "lora_finetuning.workstation_pc.serve_policy:main"
+# robot_pc
+robot-demo-sending     = "lora_finetuning.robot_pc.demo_sender:main"
+
+# The importable package `lora_finetuning` IS this directory (it is imported as
+# `lora_finetuning` from policy_learning/), so map the package name onto ".".
+[tool.setuptools]
+package-dir = { "lora_finetuning" = "." }
+packages = [
+    "lora_finetuning",
+    "lora_finetuning.common",
+    "lora_finetuning.common.transport",
+    "lora_finetuning.workstation_pc",
+    "lora_finetuning.robot_pc",
+]
+
+[tool.setuptools.package-data]
+"lora_finetuning.common.transport" = ["*.proto"]

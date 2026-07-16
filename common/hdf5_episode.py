@@ -16,7 +16,11 @@ Datasets:
   /observation/state   [N, state_dim] float
   /action              [N, act_dim]   float
   /timestamp           [N]            int64 ns
+  /intervention        [N]            uint8 (optional; 1 = human took over, dagger)
   /observation/images/{head,left_wrist,right_wrist}   [N] object (JPEG bytes)
+
+Optional dagger provenance (root attrs, any that exist):
+  policy_id / policy_path / base_ckpt   which policy generated the rollout
 """
 
 from __future__ import annotations
@@ -111,10 +115,53 @@ def read_episode_arrays(path: Path) -> dict:
             action_names = _column_names(f, ACT_FIELD_ORDER, [p.shape[1] for p in action_parts])
 
         timestamp_ns = f["/timestamp"][:]
+        n_rows = observation_state.shape[0]
 
+        # Per-frame dagger intervention flag (1 = human took over). Optional:
+        # plain teleop demos don't carry it, so default to all-zeros. A length
+        # mismatch is treated as absent rather than risking misaligned frames.
+        if "intervention" in f:
+            intervention = f["/intervention"][:].astype(np.uint8, copy=False)
+            if intervention.shape[0] != n_rows:
+                intervention = np.zeros(n_rows, dtype=np.uint8)
+        else:
+            intervention = np.zeros(n_rows, dtype=np.uint8)
+
+        # Which policy generated this rollout, if the recorder tagged it. The
+        # converter falls back to its --dagger_policy flag when this is None.
+        policy_id = None
+        for attr in ("policy_id", "policy_path", "base_ckpt", "dagger_policy"):
+            val = f.attrs.get(attr)
+            if val is not None:
+                policy_id = _as_str(val)
+                break
+
+        # Per-episode policy VERSION tag written by the recorder (the adapter
+        # version the LoRAPolicyServer was serving when this episode was
+        # collected). Authoritative for the manifest; the converter falls back
+        # to the live policy status file when this is absent. May be an int
+        # (adapter version) or a string.
+        policy_version = None
+        for attr in ("policy_version", "adapter_version", "lora_version"):
+            if attr in f.attrs:
+                v = f.attrs[attr]
+                if isinstance(v, (bytes, bytearray)):
+                    policy_version = _as_str(v)
+                elif np.issubdtype(type(v), np.integer):
+                    policy_version = int(v)
+                else:
+                    policy_version = v
+                break
+
+        # Read every camera present under /observation/images (head +
+        # both wrists in current use). The converter selects the subset its
+        # --mode declares; reading them all here keeps this function
+        # schema-agnostic.
+        img_group = f.get("/observation/images")
+        available_images = sorted(img_group.keys()) if img_group is not None else []
         images = {}
-        for name in IMAGE_NAMES:
-            ds = f[f"/observation/images/{name}"]
+        for name in available_images:
+            ds = img_group[name]
             images[f"observation.images.{name}"] = [bytes(ds[i]) for i in range(ds.shape[0])]
 
     return {
@@ -123,8 +170,12 @@ def read_episode_arrays(path: Path) -> dict:
         "observation.state": observation_state,
         "action": action,
         "timestamp_ns": timestamp_ns,
+        "intervention": intervention,
+        "policy_id": policy_id,
+        "policy_version": policy_version,
         "state_names": state_names,
         "action_names": action_names,
+        "available_images": available_images,
         **images,
     }
 
@@ -140,9 +191,10 @@ def decode_jpeg(buf: bytes) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def decode_frame_images(ep: dict, idx: int) -> dict:
-    """Decode all camera JPEGs for one frame; runs in a worker thread."""
+def decode_frame_images(ep: dict, idx: int, image_names=IMAGE_NAMES) -> dict:
+    """Decode the requested cameras' JPEGs for one frame; runs in a worker
+    thread. ``image_names`` defaults to the full-rig set."""
     return {
         f"observation.images.{name}": decode_jpeg(ep[f"observation.images.{name}"][idx])
-        for name in IMAGE_NAMES
+        for name in image_names
     }

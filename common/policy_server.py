@@ -16,11 +16,18 @@ Two things make the swap safe:
 Set ``reload_on=handshake`` to restrict swaps to client (re)connections, i.e.
 between episodes, if you don't want the policy changing mid-rollout.
 
-Usage:
-    python -m lora_finetuning.lora_policy_server \
+Shortcut (installed by `pip install -e .`): ``ws-serve-policy``.
+
+    ws-serve-policy \
         --host=0.0.0.0 --port=8080 --fps=30 \
-        --adapter_addr=trainer-host:8090 \
-        --reload_on=chunk
+        --adapter_addr=trainer-host:8090 --reload_on=chunk \
+        --version_status_file=/data/lerobot/policy_version.json
+
+``--version_status_file`` publishes the currently-serving adapter version so the
+realtime converter (its ``--policy_status_file``) can tag each dagger episode's
+manifest row with the policy version it was collected under.
+
+Equivalent module form: ``python -m lora_finetuning.common.policy_server``.
 """
 
 import logging
@@ -39,6 +46,7 @@ from lerobot.transport import services_pb2_grpc  # type: ignore
 from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import LoRAPolicyServerConfig
+from .manifest import write_policy_status
 from .transport import AdapterApplier, AdapterClient, AdapterVersion
 
 
@@ -100,6 +108,19 @@ class LoRAPolicyServer(PolicyServer):
 
             self._client.mark_loaded(meta)
             self.adapter_version = meta
+
+            # Publish the live version so a co-located converter can tag which
+            # policy version each dagger episode was collected under.
+            if self.config.version_status_file:
+                try:
+                    write_policy_status(
+                        self.config.version_status_file,
+                        version=meta.version,
+                        trainer_step=meta.step,
+                        loss=meta.loss,
+                    )
+                except OSError as e:
+                    self.logger.warning(f"could not write version status file: {e}")
 
     def _apply_adapter(self, meta: AdapterVersion) -> None:
         start = time.perf_counter()
