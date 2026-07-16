@@ -21,6 +21,14 @@ PI05_LORA_TARGETS = (
 # Policy types for which PI05_LORA_TARGETS applies.
 PI05_POLICY_TYPES = ("pi05", "pi05_mem")
 
+# Shared default for the server's --version_status_file and the converter's
+# --policy_status_file. Both processes run on the same workstation, so pointing
+# them at the same path by default means every dagger manifest row gets its
+# adapter_version/trainer_step tag with no extra flags. The server rewrites the
+# file at startup (version 0 = base policy), so a stale file from a previous
+# run cannot mislabel episodes.
+DEFAULT_POLICY_STATUS_PATH = "/tmp/lora_policy_version.json"
+
 
 @dataclass
 class LoRASpec:
@@ -119,6 +127,12 @@ class LoRATrainerConfig:
     dagger_datasets_dir: str | None = None
     dagger_dataset_glob: str = "*sirius_round*"  # which subdirs are dagger rounds
     dagger_sampling_ratio: float = 0.5  # P*(intervention) in the SIRIUS mix (baseline demos take the rest)
+    # A training round starts only when the converter *finalizes* a dagger round
+    # (not on every new episode), and the mix uses only completed rounds. The
+    # round size is the converter's --num_demos; leave this None to auto-infer it
+    # from disk (the size of rounds the converter already rolled past), or set it
+    # explicitly to override the inference.
+    dagger_round_size: int | None = None
     wait_poll_s: float = 10.0  # between rounds, poll this often for new dagger episodes/rounds
     reset_optimizer_each_round: bool = False  # also reset AdamW moments (lr+scheduler always reset)
     # `steps` is the total-step cap across all rounds; <= 0 means run rounds
@@ -147,6 +161,10 @@ class LoRATrainerConfig:
             if not 0.0 < self.dagger_sampling_ratio < 1.0:
                 raise ValueError(
                     f"dagger_sampling_ratio must be in (0, 1), got {self.dagger_sampling_ratio}"
+                )
+            if self.dagger_round_size is not None and self.dagger_round_size < 1:
+                raise ValueError(
+                    f"dagger_round_size must be >= 1 when set, got {self.dagger_round_size}"
                 )
 
 
@@ -184,11 +202,13 @@ class RealtimeConverterConfig:
     # to `dagger_policy`. Empty -> "unknown".
     dagger_policy: str = ""
 
-    # If the LoRAPolicyServer is writing its version status file (its
-    # --version_status_file), point this at the same path: each manifest row
-    # then also records the adapter version + trainer step live at conversion
-    # time -- i.e. which policy version the workstation is currently serving.
-    policy_status_file: str | None = None
+    # Path of the LoRAPolicyServer's version status file (its
+    # --version_status_file): each manifest row then also records the adapter
+    # version + trainer step live at conversion time -- i.e. which policy
+    # version the workstation is currently serving. Defaults to the same shared
+    # path as the server so version tagging works with no flags when both run
+    # on this machine. Set to "" to disable.
+    policy_status_file: str | None = DEFAULT_POLICY_STATUS_PATH
 
     # --- sirius round rollover ---------------------------------------------
     # When `dagger_datasets_dir` is set, the converter runs in ROUND mode: it
@@ -285,11 +305,18 @@ class LoRAPolicyServerConfig(PolicyServerConfig):
     # Local dir to materialize received adapters into. None -> a temp dir.
     adapter_cache_dir: str | None = None
 
-    # If set, the server writes the currently-serving adapter version (+ trainer
-    # step and loss) to this JSON file on every swap. The realtime converter
-    # reads it (its --policy_status_file) so each dagger episode's manifest row
-    # records which policy version was live when it was collected.
-    version_status_file: str | None = None
+    # The server writes the currently-serving adapter version (+ trainer step
+    # and loss) to this JSON file at startup (version 0 = base policy) and on
+    # every swap. The realtime converter reads it (its --policy_status_file) so
+    # each dagger episode's manifest row records which policy version was live
+    # when it was collected. Defaults to the same shared path as the converter
+    # so tagging works with no flags. Set to "" to disable.
+    version_status_file: str | None = DEFAULT_POLICY_STATUS_PATH
+
+    # Default (False) keeps the console to lifecycle events: startup, adapter
+    # swaps, warnings/errors. True restores the stock firehose -- per-observation
+    # inference timings and the transport layer's per-stream chatter.
+    verbose: bool = False
 
     # Where a newer adapter is allowed to be swapped in:
     #   "chunk"     -> at any action-chunk boundary (fastest propagation)

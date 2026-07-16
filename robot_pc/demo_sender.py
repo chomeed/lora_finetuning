@@ -102,6 +102,8 @@ class DemoSender:
     def _rsync(self, src: Path, remote_name: str) -> None:
         dest = f"{self.a.remote}:{self.a.remote_dir}/{remote_name}"
         cmd = ["rsync", "-a", "--partial", "-e", " ".join(shlex.quote(x) for x in self._ssh)]
+        if sys.stdout.isatty():
+            cmd.append("--info=progress2")  # live percentage/rate when run interactively
         if self.a.bwlimit:
             cmd.append(f"--bwlimit={self.a.bwlimit}")
         if self.a.dry_run:
@@ -140,6 +142,8 @@ class DemoSender:
     def _send_one(self, path: Path) -> None:
         remote_final = path.name  # episode_x.h5
         remote_partial = remote_final + ".partial"
+        size_mb = path.stat().st_size / (1 << 20)
+        logger.info(f"sending {path.name} ({size_mb:.1f} MB) -> {self.a.remote}:{self.a.remote_dir}")
         self._ensure_remote_dir()
 
         # 1. sidecar first, so it is already present the instant the .h5 appears.
@@ -150,6 +154,7 @@ class DemoSender:
             self._rsync(sidecar, remote_final + ".sha256")
 
         # 2. body to a staging name the converter's glob ignores.
+        logger.info(f"  uploading {path.name} ...")
         self._rsync(path, remote_partial)
 
         # 3. atomic reveal.
@@ -184,24 +189,33 @@ class DemoSender:
             f"({'run-once' if self.a.run_once else 'daemon'}{', dry-run' if self.a.dry_run else ''})"
         )
         n_ok = 0
+        idle_logged = False
         while not self._stop:
             batch = self._ready_files()
             if not batch:
                 if self.a.run_once:
                     break
+                if not idle_logged:
+                    logger.info(f"queue empty; waiting for new episodes ({n_ok} sent so far)")
+                    idle_logged = True
                 time.sleep(self.a.poll_interval_s)
                 continue
+            idle_logged = False
+            if len(batch) > 1:
+                logger.info(f"{len(batch)} episode(s) queued")
             for path in batch:
                 if self._stop:
                     break
                 try:
+                    size_mb = path.stat().st_size / (1 << 20)
                     t0 = time.perf_counter()
                     self._send_one(path)
                 except (OSError, subprocess.CalledProcessError) as e:
                     logger.error(f"FAILED {path.name}: {e} (will retry next scan)")
                     continue
                 n_ok += 1
-                logger.info(f"sent {path.name} in {time.perf_counter() - t0:.1f}s")
+                dt = time.perf_counter() - t0
+                logger.info(f"sent {path.name} ({size_mb:.1f} MB) in {dt:.1f}s, {size_mb / dt:.1f} MB/s")
             if self.a.run_once and not self._ready_files():
                 break
         logger.info(f"exiting: {n_ok} episode(s) sent this run")

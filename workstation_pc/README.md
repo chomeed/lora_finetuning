@@ -24,6 +24,8 @@ workstation:
                        an adapter each round, resets LR, waits for the next round
   ws-serve-policy  ◀── pulls + hot-swaps the adapter; writes its live version to
                        --version_status_file, which the converter tags episodes with
+                       (both default to /tmp/lora_policy_version.json — wired
+                       automatically when everything runs on one machine)
 ```
 
 ### Converter — SIRIUS round mode
@@ -33,9 +35,12 @@ ws-real-time-converter \
     --ingest_dir=/data/incoming/tmp_demo \
     --dagger_datasets_dir=/data/lerobot/dagger \
     --default_task=board_insertion --mode=insertion_15 \
-    --num-demos 30 \
-    --policy_status_file=/data/lerobot/policy_version.json
+    --num-demos 30
 ```
+
+`--policy_status_file` defaults to the server's `--version_status_file` path
+(`/tmp/lora_policy_version.json`), so adapter-version tagging works with no
+extra flags; pass `--policy_status_file=""` to disable.
 
 Writes `board_insertion_sirius_round1`, and every `--num_demos` episodes rolls
 over to `…_round2`, `…_round3`, … continuously. `--mode` projects the full-rig
@@ -48,14 +53,13 @@ Omit `--dagger_datasets_dir` for single-dataset mode.
 
 ```bash
 ws-lora-finetuning \
-    --pretrained_path=outputs/.../pretrained_model \
+    --pretrained_path=/home/rllab4/workspace/chomeed/hdr_robot/policy_learning/outputs/sirius/board_insertion_pi05 \
     --dagger_loop=true \
-    --baseline_dataset_repo_id=chomeed/board_insertion_ablation_head \
-    --baseline_dataset_root=/data/lerobot/board_insertion_ablation_head \
-    --dagger_datasets_dir=/data/lerobot/dagger \
+    --baseline_dataset_repo_id=chomeed/board_insertion_ablation_head_fixed_quantile_k30_relative_action \
+    --dagger_datasets_dir=/home/rllab4/workspace/chomeed/hdr_robot/policy_learning/lora_finetuning/tests3_lerobot \
     --dataset_repo_id=unused-in-dagger-mode \
-    --serve_host=127.0.0.1 --serve_port=8090 --publish-freq 500 \
-    --lora_variant medium
+    --serve_host=127.0.0.1 --serve_port=8090 --publish-freq 50 \
+    --lora_variant small
 ```
 
 Each round: rebuild a `SIRIUSDataset` mix of the baseline demos (all frames) +
@@ -69,6 +73,10 @@ for quick tests vs full runs. `--steps<=0` runs forever.
 
 ```bash
 ws-serve-policy --host=0.0.0.0 --port=8080 --fps=30 \
-    --adapter_addr=127.0.0.1:8090 --reload_on=chunk \
-    --version_status_file=/data/lerobot/policy_version.json
+    --adapter_addr=127.0.0.1:8090 --reload_on=chunk
 ```
+
+The server writes its live adapter version to `--version_status_file`
+(default `/tmp/lora_policy_version.json`; version 0 = base policy at startup).
+The console shows lifecycle events only (startup, adapter swaps, errors);
+pass `--verbose=true` for the stock per-observation inference logs.

@@ -20,12 +20,16 @@ Shortcut (installed by `pip install -e .`): ``ws-serve-policy``.
 
     ws-serve-policy \
         --host=0.0.0.0 --port=8080 --fps=30 \
-        --adapter_addr=trainer-host:8090 --reload_on=chunk \
-        --version_status_file=/data/lerobot/policy_version.json
+        --adapter_addr=trainer-host:8090 --reload_on=chunk
 
-``--version_status_file`` publishes the currently-serving adapter version so the
-realtime converter (its ``--policy_status_file``) can tag each dagger episode's
-manifest row with the policy version it was collected under.
+``--version_status_file`` (default ``/tmp/lora_policy_version.json``, shared with
+the converter's ``--policy_status_file``) publishes the currently-serving adapter
+version so the converter can tag each dagger episode's manifest row with the
+policy version it was collected under. Written at startup as version 0 (= base
+policy) and rewritten on every swap.
+
+The console shows lifecycle events only (startup, adapter swaps, errors); pass
+``--verbose=true`` to restore lerobot's per-observation inference logging.
 
 Equivalent module form: ``python -m lora_finetuning.common.policy_server``.
 """
@@ -52,7 +56,12 @@ from .transport import AdapterApplier, AdapterClient, AdapterVersion
 
 class LoRAPolicyServer(PolicyServer):
     prefix = "lora_policy_server"
+    # Inherited PolicyServer code logs its per-observation chatter through this;
+    # quiet mode (the default) demotes it to WARNING in serve().
     logger = get_logger(prefix)
+    # Our own lifecycle events (startup, adapter swaps) use a separate logger so
+    # they stay visible when the stock chatter above is demoted.
+    lora_logger = logging.getLogger("lora_adapter")
 
     def __init__(self, config: LoRAPolicyServerConfig):
         super().__init__(config)
@@ -64,12 +73,21 @@ class LoRAPolicyServer(PolicyServer):
 
         if config.adapter_addr:
             self._client = AdapterClient(config.adapter_addr, root=config.adapter_cache_dir)
-            self.logger.info(
+            self.lora_logger.info(
                 f"Pulling LoRA adapters from {config.adapter_addr} (reload_on={config.reload_on})"
             )
         else:
             self._client = None
-            self.logger.info("No adapter_addr set: running as a stock PolicyServer (no hot-reload)")
+            self.lora_logger.info("No adapter_addr set: running as a stock PolicyServer (no hot-reload)")
+
+        # Start the status file at version 0 (= base policy, no adapter applied
+        # yet) so a stale file left by a previous run can never mislabel the
+        # episodes collected before this run's first swap.
+        if config.version_status_file:
+            try:
+                write_policy_status(config.version_status_file, version=0)
+            except OSError as e:
+                self.lora_logger.warning(f"could not write version status file: {e}")
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """Load the base policy (stock behavior), then attach the current adapter."""
@@ -103,7 +121,7 @@ class LoRAPolicyServer(PolicyServer):
                 # A bad adapter must not take the robot down: keep serving the
                 # weights we already have. mark_loaded is skipped, so a later
                 # (fixed) publish will be retried.
-                self.logger.error(f"Failed to load adapter v{meta.version} from {meta.local_dir}: {e}")
+                self.lora_logger.error(f"Failed to load adapter v{meta.version} from {meta.local_dir}: {e}")
                 return
 
             self._client.mark_loaded(meta)
@@ -120,22 +138,36 @@ class LoRAPolicyServer(PolicyServer):
                         loss=meta.loss,
                     )
                 except OSError as e:
-                    self.logger.warning(f"could not write version status file: {e}")
+                    self.lora_logger.warning(f"could not write version status file: {e}")
 
     def _apply_adapter(self, meta: AdapterVersion) -> None:
         start = time.perf_counter()
         action = self._applier.apply(self.policy, meta.local_dir, version=meta.version)
         elapsed = (time.perf_counter() - start) * 1000
-        self.logger.info(
+        self.lora_logger.info(
             f"LoRA adapter v{meta.version} {action} (trainer step {meta.step}, "
             f"loss {meta.loss if meta.loss is not None else float('nan'):.4f}) in {elapsed:.0f}ms"
         )
+
+
+class _DropTransportChatter(logging.Filter):
+    """Drop lerobot transport/utils chatter ("Starting receiver", byte counts),
+    which the library logs on the ROOT logger for every gRPC stream."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.pathname.endswith("transport/utils.py")
 
 
 @draccus.wrap()
 def serve(cfg: LoRAPolicyServerConfig):
     # Silence PI05's per-image resize_with_pad_torch warning (fires every forward).
     logging.getLogger("lerobot.policies.pi05.modeling_pi05").setLevel(logging.ERROR)
+    if not cfg.verbose:
+        # Keep the console to lifecycle events (startup, adapter swaps, errors):
+        # demote the stock PolicyServer's per-observation INFO chatter -- WARNING
+        # and up still surface -- and drop the transport layer's per-stream noise.
+        logging.getLogger(LoRAPolicyServer.prefix).setLevel(logging.WARNING)
+        logging.getLogger().addFilter(_DropTransportChatter())
     logging.info(pformat(asdict(cfg)))
 
     policy_server = LoRAPolicyServer(cfg)
@@ -144,11 +176,11 @@ def serve(cfg: LoRAPolicyServerConfig):
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(policy_server, server)
     server.add_insecure_port(f"{cfg.host}:{cfg.port}")
 
-    policy_server.logger.info(f"LoRAPolicyServer started on {cfg.host}:{cfg.port}")
+    policy_server.lora_logger.info(f"LoRAPolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
     server.wait_for_termination()
 
-    policy_server.logger.info("Server terminated")
+    policy_server.lora_logger.info("Server terminated")
 
 
 if __name__ == "__main__":
