@@ -49,6 +49,17 @@ class LoRASpec:
         return overrides
 
 
+# Predefined LoRA sizes. `--lora_variant small` is the quick-test config (fewer
+# trainable params -> faster steps, less VRAM); `medium` matches the standalone
+# default (r=16); `big` for a higher-capacity adapter. Override individual knobs
+# with `--lora.r` / `--lora.lora_alpha` etc. after picking a variant.
+LORA_VARIANTS = {
+    "small": dict(r=4, lora_alpha=8),
+    "medium": dict(r=16, lora_alpha=32),
+    "big": dict(r=32, lora_alpha=64),
+}
+
+
 @dataclass
 class LoRATrainerConfig:
     """Config for `trainer.py`: flow-matching BC on a LeRobot dataset, LoRA only."""
@@ -81,6 +92,9 @@ class LoRATrainerConfig:
     gradient_checkpointing: bool = True  # trades ~30% step time for a lot of VRAM
 
     lora: LoRASpec = field(default_factory=LoRASpec)
+    # One of LORA_VARIANTS ("small"/"medium"/"big"); sets lora.r + lora.lora_alpha
+    # so you can quick-test with `--lora_variant small`. None = use `lora` as given.
+    lora_variant: str | None = None
 
     # --- publishing --------------------------------------------------------
     publish_freq: int = 500  # steps between adapter publishes
@@ -88,11 +102,52 @@ class LoRATrainerConfig:
     log_freq: int = 50
     resume_adapter_path: str | None = None  # continue from a published adapter dir
 
+    # --- dagger round loop (the "lora finetuning service" behavior) --------
+    # When enabled, training runs in rounds: train `publish_freq` steps on a
+    # 50/50 mix of the baseline demos and the (growing) dagger dataset, publish
+    # the adapter, reset the LR + scheduler, then WAIT for the converter to add
+    # new dagger episodes before starting the next round. Normalization always
+    # reuses the baseline checkpoint's stats (via the preprocessor loaded from
+    # `pretrained_path`) -- dataset stats are never recomputed.
+    dagger_loop: bool = False
+    baseline_dataset_repo_id: str | None = None  # fixed baseline demos to mix with dagger data
+    baseline_dataset_root: str | None = None
+    # Parent directory holding the per-round dagger datasets, each a LeRobot
+    # dataset written by the converter and named <task>_sirius_round<N>
+    # (e.g. board_insertion_sirius_round1, board_insertion_sirius_round2). Every
+    # round the loop rebuilds a SIRIUS mix of the baseline + all rounds present.
+    dagger_datasets_dir: str | None = None
+    dagger_dataset_glob: str = "*sirius_round*"  # which subdirs are dagger rounds
+    dagger_sampling_ratio: float = 0.5  # P*(intervention) in the SIRIUS mix (baseline demos take the rest)
+    wait_poll_s: float = 10.0  # between rounds, poll this often for new dagger episodes/rounds
+    reset_optimizer_each_round: bool = False  # also reset AdamW moments (lr+scheduler always reset)
+    # `steps` is the total-step cap across all rounds; <= 0 means run rounds
+    # forever (until Ctrl-C).
+
     def __post_init__(self):
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         if self.publish_freq < 1:
             raise ValueError(f"publish_freq must be >= 1, got {self.publish_freq}")
+        if self.lora_variant is not None:
+            if self.lora_variant not in LORA_VARIANTS:
+                raise ValueError(
+                    f"unknown lora_variant {self.lora_variant!r}; choose one of {sorted(LORA_VARIANTS)}"
+                )
+            for k, v in LORA_VARIANTS[self.lora_variant].items():
+                setattr(self.lora, k, v)
+        if self.dagger_loop:
+            if not self.baseline_dataset_repo_id:
+                raise ValueError("dagger_loop=True needs --baseline_dataset_repo_id to mix against")
+            if not self.dagger_datasets_dir:
+                raise ValueError(
+                    "dagger_loop=True needs --dagger_datasets_dir (parent of the "
+                    "<task>_sirius_round* datasets)"
+                )
+            if not 0.0 < self.dagger_sampling_ratio < 1.0:
+                raise ValueError(
+                    f"dagger_sampling_ratio must be in (0, 1), got {self.dagger_sampling_ratio}"
+                )
 
 
 @dataclass
@@ -103,13 +158,54 @@ class RealtimeConverterConfig:
 
     # --- what to watch / where to write ------------------------------------
     ingest_dir: str  # directory the robot uploads finished episode_*.h5 into
-    dataset_repo_id: str  # LeRobot dataset id to append into, e.g. "chomeed/board_handover"
-    dataset_root: str  # local dir for the growing dataset (created on first episode)
+    # SINGLE-dataset mode target (required unless round mode). In round mode
+    # (--dagger_datasets_dir) both are unused -- the round datasets are named
+    # <task>_sirius_round<N> under that dir with repo_id <repo_namespace>/<name>.
+    dataset_repo_id: str = ""  # LeRobot dataset id to append into, e.g. "chomeed/board_handover"
+    dataset_root: str = ""  # local dir for the growing dataset (created on first episode)
 
     glob: str = "episode_*.h5"  # which files in ingest_dir are episodes
     default_task: str = ""  # task string when an episode's `task` attr is empty
     task_filter: str | None = None  # if set, only convert episodes whose task matches
     fps: int = 30  # fallback fps when the episode carries none
+
+    # --- observation/action schema -----------------------------------------
+    # Project the full-rig recording down to a policy's I/O schema before
+    # writing the dataset (see common/schema.py MODE_SCHEMAS). "full" keeps all
+    # 41-D state / 19-D action and every camera; the reduced modes select the
+    # channels + cameras the matching checkpoint was trained on.
+    mode: str = "full"
+
+    # --- dagger provenance -------------------------------------------------
+    # Which policy produced the rollouts this run ingests. Recorded per episode
+    # in the dataset's dagger manifest (meta/dagger_manifest.jsonl). An episode
+    # that tags its own policy in an HDF5 attr (policy_id/policy_path/base_ckpt)
+    # overrides this; otherwise every episode this run converts is attributed
+    # to `dagger_policy`. Empty -> "unknown".
+    dagger_policy: str = ""
+
+    # If the LoRAPolicyServer is writing its version status file (its
+    # --version_status_file), point this at the same path: each manifest row
+    # then also records the adapter version + trainer step live at conversion
+    # time -- i.e. which policy version the workstation is currently serving.
+    policy_status_file: str | None = None
+
+    # --- sirius round rollover ---------------------------------------------
+    # When `dagger_datasets_dir` is set, the converter runs in ROUND mode: it
+    # writes into `<task>_sirius_round<N>` datasets under that parent dir and,
+    # once a round reaches `num_demos` episodes, it finalizes that round and
+    # opens the next one -- converting continuously, never stopping. The trainer's
+    # `--dagger_datasets_dir` should point at the same parent. `repo_namespace`
+    # is the HF namespace for each round's repo_id (dir name = <task>_sirius_round<N>).
+    dagger_datasets_dir: str | None = None
+    repo_namespace: str = "chomeed"
+
+    # --- episode cap -------------------------------------------------------
+    # ROUND mode: episodes per round before rolling to the next dataset.
+    # SINGLE-dataset mode (no dagger_datasets_dir): stop and exit once the dataset
+    # holds this many episodes total. None -> no cap (single mode runs forever).
+    # Exposed as `--num_demos` on the console script.
+    num_demos: int | None = None
 
     # --- scan / loop -------------------------------------------------------
     poll_interval_s: float = 2.0  # sleep between ingest-dir scans when idle
@@ -156,6 +252,25 @@ class RealtimeConverterConfig:
                 f"gpu_util_resume ({self.gpu_util_resume}) must be <= gpu_util_pause "
                 f"({self.gpu_util_pause}) for the hysteresis to make sense"
             )
+        from .schema import MODE_SCHEMAS, resolve_mode
+
+        if resolve_mode(self.mode) not in MODE_SCHEMAS:
+            raise ValueError(
+                f"unknown mode {self.mode!r}; choose one of {sorted(MODE_SCHEMAS)} "
+                "(see common/schema.py)"
+            )
+        if self.num_demos is not None and self.num_demos < 1:
+            raise ValueError(f"num_demos must be >= 1 when set, got {self.num_demos}")
+        if self.dagger_datasets_dir is not None:
+            if self.num_demos is None:
+                raise ValueError("round mode (--dagger_datasets_dir) needs --num_demos (episodes per round)")
+            if not self.default_task:
+                raise ValueError("round mode needs --default_task (used to name <task>_sirius_round<N>)")
+        elif not (self.dataset_repo_id and self.dataset_root):
+            raise ValueError(
+                "single-dataset mode needs --dataset_repo_id and --dataset_root "
+                "(or use --dagger_datasets_dir for sirius round mode)"
+            )
 
 
 @dataclass
@@ -169,6 +284,12 @@ class LoRAPolicyServerConfig(PolicyServerConfig):
 
     # Local dir to materialize received adapters into. None -> a temp dir.
     adapter_cache_dir: str | None = None
+
+    # If set, the server writes the currently-serving adapter version (+ trainer
+    # step and loss) to this JSON file on every swap. The realtime converter
+    # reads it (its --policy_status_file) so each dagger episode's manifest row
+    # records which policy version was live when it was collected.
+    version_status_file: str | None = None
 
     # Where a newer adapter is allowed to be swapped in:
     #   "chunk"     -> at any action-chunk boundary (fastest propagation)

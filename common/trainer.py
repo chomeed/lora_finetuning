@@ -12,25 +12,40 @@ one its AdapterService serves. A ``lora_policy_server.py`` pulls the latest adap
 over gRPC whenever it wants and swaps it into the running policy without a restart --
 the trainer hosts the server and holds the current adapter; it never pushes.
 
-Usage:
-    python -m lora_finetuning.trainer \
-        --pretrained_path=/home/rllab4/workspace/chomeed/hdr_robot/policy_learning/outputs/ablation/board_insertion_ablation_third_pi05_delta_recomputed_stats_25k \
-        --dataset_repo_id=chomeed/board_insertion_ablation_dagger \
-        --serve_host=0.0.0.0 --serve_port=8090 \
-        --steps=20000 --batch_size=8 --lr=1e-4
+Shortcut (installed by `pip install -e .`): ``ws-lora-finetuning`` -- the same
+command runs on the workstation (bind ``--serve_host=127.0.0.1``, adapter over
+loopback) or a remote GPU box (bind ``--serve_host=0.0.0.0``).
+``--publish-freq`` == ``--publish_freq``; ``--lora_variant small`` for a quick test.
 
-    python -m lora_finetuning.trainer \
+    # single-shot: fine-tune once on a fixed dataset
+    ws-lora-finetuning \
         --pretrained_path=outputs/ablation/board_insertion_ablation_head_pi05_delta_recomputed_stats_25k \
         --dataset_repo_id=chomeed/board_insertion_ablation_dagger \
-        --serve_host=0.0.0.0 --serve_port=8090 \
+        --serve_host=127.0.0.1 --serve_port=8090 --publish-freq 500 \
         --steps=20000 --batch_size=8 --lr=1e-4
+
+    # DAgger service: rounds of (train 500 steps -> publish -> reset lr -> wait
+    # for new dagger data), mixing baseline demos 50/50 with the intervention
+    # transitions of every <task>_sirius_round* dataset found so far
+    ws-lora-finetuning \
+        --pretrained_path=outputs/ablation/board_insertion_ablation_head_pi05_delta_recomputed_stats_25k \
+        --dagger_loop=true \
+        --baseline_dataset_repo_id=chomeed/board_insertion_ablation_head \
+        --baseline_dataset_root=/data/lerobot/board_insertion_ablation_head \
+        --dagger_datasets_dir=/data/lerobot/dagger \
+        --dataset_repo_id=unused-in-dagger-mode \
+        --serve_host=127.0.0.1 --serve_port=8090 --publish-freq 500 --lr=1e-4
+
+Equivalent module form: ``python -m lora_finetuning.common.trainer``.
 """
 
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 
 import draccus
@@ -156,6 +171,187 @@ def build_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
     )
 
 
+# ── DAgger round loop ──────────────────────────────────────────────────────
+def _discover_dagger_rounds(cfg: LoRATrainerConfig) -> list[tuple[str, Path]]:
+    """The per-round dagger datasets present under ``dagger_datasets_dir``, sorted
+    (e.g. board_insertion_sirius_round1, ..._round2). Returns (repo_id, root)
+    pairs, repo_id = the directory name. Only dirs with a finalized info.json
+    count, so a half-written round is ignored until it's a valid dataset."""
+    parent = Path(cfg.dagger_datasets_dir)
+    rounds = []
+    if parent.exists():
+        for d in sorted(parent.glob(cfg.dagger_dataset_glob)):
+            if d.is_dir() and (d / "meta" / "info.json").exists():
+                rounds.append((d.name, d))
+    return rounds
+
+
+def _dagger_total_episodes(cfg: LoRATrainerConfig) -> int:
+    """Total episodes across every dagger round dir -- grows both when the
+    current round gains episodes and when a new round appears."""
+    total = 0
+    for _, root in _discover_dagger_rounds(cfg):
+        try:
+            total += int(json.loads((root / "meta" / "info.json").read_text()).get("total_episodes", 0))
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
+            pass
+    return total
+
+
+def build_dagger_dataloader(cfg: LoRATrainerConfig, policy) -> DataLoader:
+    """SIRIUS-weighted loader over [baseline demos, dagger round 1, round 2, ...].
+
+    Reuses ``lerobot_sirius.dataset.SIRIUSDataset``: the baseline demos are class
+    ``demo`` (all frames) and every dagger round contributes ONLY its intervention
+    transitions (``p_robot_max=0``, ``p_preintv=0``), mixed at
+    ``p_intv=dagger_sampling_ratio`` (0.5 -> 50/50 demo/intervention). Must be
+    rebuilt every round because a new round dataset appears (and the current one
+    grows) between rounds.
+
+    ``use_recomputed_stats=False`` freezes SIRIUS's stats to the baseline demo
+    dataset; and the training loop normalizes with the checkpoint's preprocessor
+    regardless, so baseline normalization stats are never recomputed."""
+    from lerobot_sirius.dataset import SIRIUSDataset
+
+    meta = LeRobotDatasetMetadata(cfg.baseline_dataset_repo_id, root=cfg.baseline_dataset_root)
+    delta_timestamps = resolve_delta_timestamps(policy.config, meta)
+    rounds = _discover_dagger_rounds(cfg)
+    # baseline (demo) first, then dagger rounds in order -- SIRIUS's curriculum
+    # indexing expects the demo dataset(s) and the daggers in round order.
+    repo_ids = [cfg.baseline_dataset_repo_id, *[rid for rid, _ in rounds]]
+    roots = {cfg.baseline_dataset_repo_id: cfg.baseline_dataset_root}
+    roots.update({rid: str(root) for rid, root in rounds})
+    ds = SIRIUSDataset(
+        repo_ids=repo_ids,
+        roots=roots,
+        p_intv=cfg.dagger_sampling_ratio,
+        p_preintv=0.0,
+        p_robot_max=0.0,  # only the intervention transitions from the dagger data
+        use_recomputed_stats=False,  # freeze normalization to the baseline demo stats
+        delta_timestamps=delta_timestamps,
+    )
+    logger.info(f"dagger mix ({len(rounds)} round(s)):\n{ds}")
+    return DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        sampler=ds.make_sampler(),
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.device != "cpu",
+        drop_last=True,
+        persistent_workers=cfg.num_workers > 0,
+    )
+
+
+def _run_dagger_loop(cfg, policy, peft_model, preprocessor, publisher, autocast, version: int) -> int:
+    """Round loop: wait for new dagger episodes -> rebuild the 50/50 mixed loader
+    -> reset LR + scheduler -> train ``publish_freq`` steps -> publish -> repeat.
+    ``cfg.steps <= 0`` runs forever (until Ctrl-C)."""
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.parameters() if p.requires_grad],
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+    unbounded = cfg.steps <= 0
+    global_step = 0
+    trained_through = 0  # dagger episode count the last round trained on
+    round_idx = 0
+    policy.train()
+
+    while unbounded or global_step < cfg.steps:
+        # 1. wait for the converter to add new dagger episodes / a new round.
+        have = _dagger_total_episodes(cfg)
+        announced = False
+        while have <= trained_through or have == 0:
+            if not announced:
+                logger.info(
+                    f"round {round_idx}: waiting for new dagger episodes "
+                    f"(have {have}, trained through {trained_through})..."
+                )
+                announced = True
+            time.sleep(cfg.wait_poll_s)
+            have = _dagger_total_episodes(cfg)
+
+        # 2. rebuild the mixed loader over baseline + all dagger rounds so far.
+        try:
+            dataloader = build_dagger_dataloader(cfg, policy)
+        except ValueError as e:
+            # e.g. the new episodes carry no intervention frames yet, so the
+            # intv class is empty and p_intv can't be satisfied -- wait for more.
+            logger.info(f"round {round_idx}: {e}; waiting for more dagger data")
+            trained_through = have
+            time.sleep(cfg.wait_poll_s)
+            continue
+
+        # 3. reset LR + scheduler each round (fresh warmup over the round).
+        for g in optimizer.param_groups:
+            g["lr"] = cfg.lr
+        if cfg.reset_optimizer_each_round:
+            optimizer = torch.optim.AdamW(
+                [p for p in policy.parameters() if p.requires_grad],
+                lr=cfg.lr,
+                weight_decay=cfg.weight_decay,
+            )
+        round_len = cfg.publish_freq if unbounded else min(cfg.publish_freq, cfg.steps - global_step)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda s: _lr_lambda(s, cfg.warmup_steps, round_len)
+        )
+
+        # 4. train one round.
+        dl_iter = iter(dataloader)
+        disp_loss, disp_n = 0.0, 0  # for the progress bar (reset each log)
+        round_loss, round_n = 0.0, 0  # for the published loss (whole round)
+        pbar = tqdm(total=round_len, desc=f"round {round_idx} -> v{version}", unit="step", dynamic_ncols=True)
+        for _ in range(round_len):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(cfg.grad_accum_steps):
+                try:
+                    batch = next(dl_iter)
+                except StopIteration:
+                    dl_iter = iter(dataloader)
+                    batch = next(dl_iter)
+                batch = preprocessor(batch)
+                with autocast:
+                    loss, _ = policy.forward(batch)
+                    loss = loss / cfg.grad_accum_steps
+                loss.backward()
+                full = loss.item() * cfg.grad_accum_steps
+                disp_loss += full
+                disp_n += 1
+                round_loss += full
+                round_n += 1
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in policy.parameters() if p.requires_grad],
+                cfg.grad_clip_norm,
+                error_if_nonfinite=False,
+            )
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            pbar.update(1)
+            if global_step % cfg.log_freq == 0:
+                pbar.set_postfix(
+                    step=f"{global_step}",
+                    loss=f"{disp_loss / max(disp_n, 1):.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.1e}",
+                )
+                disp_loss, disp_n = 0.0, 0
+        pbar.close()
+
+        # 5. publish this round's adapter, then loop back to wait for more data.
+        avg = round_loss / round_n if round_n else None
+        meta = publisher.publish(peft_model, version=version, step=global_step, loss=avg)
+        logger.info(
+            f"round {round_idx}: published adapter v{meta.version} "
+            f"(step {global_step}, {have} dagger episode(s), loss "
+            f"{avg:.4f})" if avg is not None else f"round {round_idx}: published v{meta.version}"
+        )
+        version += 1
+        trained_through = have
+        round_idx += 1
+
+    return version
+
+
 @draccus.wrap()
 def train(cfg: LoRATrainerConfig):
     # force=True: lerobot's import installs a root WARNING handler; without force this
@@ -186,17 +382,6 @@ def train(cfg: LoRATrainerConfig):
         postprocessor_overrides={"device_processor": {"device": cfg.device}},
     )
 
-    dataloader = build_dataloader(cfg, policy)
-
-    optimizer = torch.optim.AdamW(
-        [p for p in policy.parameters() if p.requires_grad],
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda s: _lr_lambda(s, cfg.warmup_steps, cfg.steps)
-    )
-
     publisher = AdapterPublisher(host=cfg.serve_host, port=cfg.serve_port)
     publisher.start()
     version = 1
@@ -213,6 +398,34 @@ def train(cfg: LoRATrainerConfig):
         device_type="cuda" if cfg.device.startswith("cuda") else "cpu",
         dtype=torch.bfloat16,
         enabled=cfg.use_amp,
+    )
+
+    # DAgger service: train publish_freq steps on a 50/50 baseline+dagger mix
+    # (dagger contributes only its intervention transitions), publish, reset the
+    # LR + scheduler, then wait for the converter to add new dagger episodes /
+    # a new round. Normalization always reuses the baseline checkpoint stats.
+    if cfg.dagger_loop:
+        try:
+            _run_dagger_loop(cfg, policy, peft_model, preprocessor, publisher, autocast, version)
+        except KeyboardInterrupt:
+            logger.info("dagger loop interrupted")
+        logger.info("dagger loop finished; still serving the latest adapter (Ctrl-C to exit)")
+        try:
+            publisher.wait()
+        except KeyboardInterrupt:
+            publisher.stop()
+        return
+
+    # ---- single-shot training on a fixed dataset ----
+    dataloader = build_dataloader(cfg, policy)
+
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.parameters() if p.requires_grad],
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda s: _lr_lambda(s, cfg.warmup_steps, cfg.steps)
     )
 
     policy.train()
