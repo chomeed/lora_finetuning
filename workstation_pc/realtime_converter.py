@@ -204,6 +204,11 @@ class RealtimeConverter:
         self.schema = get_schema(cfg.mode)
         self.state_idx = projection_indices(STATE_KEYS, self.schema.state_keys)
         self.action_idx = projection_indices(ACTION_KEYS, self.schema.action_keys)
+        # Full mode is the archival schema: carry the Delto fingertip F/T sensor
+        # streams (observation.fingertip_left/right, 30-D each) through when the
+        # recording has them. Projected modes must match the policy's I/O
+        # exactly, so they never include these.
+        self.archive_fingertips = resolve_mode(cfg.mode) == "full"
 
         # ── dataset target ──────────────────────────────────────────────
         # ROUND mode (dagger_datasets_dir set): write <task>_sirius_round<N>
@@ -411,6 +416,16 @@ class RealtimeConverter:
                 "shape": image_shapes[name],
                 "names": ("channels", "height", "width"),
             }
+        # Archival extras (full mode only): fingertip F/T streams, when recorded.
+        if self.archive_fingertips:
+            for side in ("left", "right"):
+                k = f"observation.fingertip_{side}"
+                if k in ep:
+                    features[k] = {
+                        "dtype": "float32",
+                        "shape": (ep[k].shape[1],),
+                        "names": None,
+                    }
         logger.info(f"creating dataset {self.repo_id} at {self.root}")
         return LeRobotDataset.create(
             repo_id=self.repo_id,
@@ -469,6 +484,13 @@ class RealtimeConverter:
         # the column; only emit it when the (resumed) schema includes it so
         # appends stay schema-compatible. Freshly created datasets always do.
         has_intervention = "intervention" in getattr(ds.meta, "features", {})
+        # Fingertip F/T columns the (possibly resumed) dataset declares. An
+        # episode missing a declared stream writes zeros, so appends across
+        # mixed recordings stay schema-compatible.
+        fingertip_keys = [
+            k for k in ("observation.fingertip_left", "observation.fingertip_right")
+            if k in getattr(ds.meta, "features", {})
+        ]
         try:
             # Pre-decode JPEGs in worker threads while add_frame consumes; cv2
             # releases the GIL so decode scales across cores.
@@ -491,6 +513,9 @@ class RealtimeConverter:
                     }
                     if has_intervention:
                         frame["intervention"] = np.asarray([ep["intervention"][idx]], dtype=np.int64)
+                    for k in fingertip_keys:
+                        dim = ds.meta.features[k]["shape"][0]
+                        frame[k] = ep[k][idx] if k in ep else np.zeros(dim, dtype=np.float32)
                     ds.add_frame(frame)
             ds.save_episode()
             # finalize() flushes parquet footers + info.json: the episode is now a

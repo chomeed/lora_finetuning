@@ -43,8 +43,11 @@ ws-real-time-converter \
 extra flags; pass `--policy_status_file=""` to disable.
 
 Because `--mode` projects the recording down, the converter also archives every
-episode **unprojected** (full 41-D state / 19-D action: fingertip F/T, head,
-lift, both arms) into a parallel tree next to the target:
+episode **unprojected** into a parallel tree next to the target: full 41-D
+state / 19-D action (head, lift, both arms + both 12-DoF grippers) plus the
+Delto fingertip F/T sensor streams as separate `observation.fingertip_left`
+/ `observation.fingertip_right` features (30-D each) when the recording has
+them. Tree layout:
 `<dagger_datasets_dir>_full/<task>_sirius_round<N>` (or `<dataset_root>_full` in
 single mode). A projected dataset can then be regenerated with a different mode
 later. `--keep_full_copy=false` disables it; no effect when `--mode=full`.

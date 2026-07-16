@@ -73,7 +73,8 @@ def read_episode_arrays(path: Path) -> dict:
 
         fps, task, observation.state [N, D], action [N, A], timestamp_ns [N],
         state_names [D], action_names [A],
-        observation.images.{head,left_wrist,right_wrist}  list[bytes] (length N)
+        observation.images.{head,left_wrist,right_wrist}  list[bytes] (length N),
+        observation.fingertip_{left,right} [N, 30]  (only when recorded)
 
     Raises SchemaVersionMismatch if the file's ``schema_version`` is unsupported.
     """
@@ -153,6 +154,18 @@ def read_episode_arrays(path: Path) -> dict:
                     policy_version = v
                 break
 
+        # Optional Delto fingertip F/T sensor streams, (N, 30) float32 per
+        # gripper, recorded alongside the joint state. Not part of any policy
+        # I/O schema; the converter archives them in the full-schema copy. A
+        # length mismatch is treated as absent (same policy as intervention).
+        fingertips = {}
+        for side in ("left", "right"):
+            key = f"/observation/fingertip_{side}"
+            if key in f:
+                arr = f[key][:].astype(np.float32, copy=False)
+                if arr.ndim == 2 and arr.shape[0] == n_rows:
+                    fingertips[f"observation.fingertip_{side}"] = arr
+
         # Read every camera present under /observation/images (head +
         # both wrists in current use). The converter selects the subset its
         # --mode declares; reading them all here keeps this function
@@ -176,6 +189,7 @@ def read_episode_arrays(path: Path) -> dict:
         "state_names": state_names,
         "action_names": action_names,
         "available_images": available_images,
+        **fingertips,
         **images,
     }
 
